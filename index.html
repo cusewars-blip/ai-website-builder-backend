@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>AI Website Builder — Backend Demo</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, -apple-system, sans-serif; background: #0b0b12; color: #f0e9d8; }
+  header { padding: 20px 28px; border-bottom: 1px solid #2a2a35; display: flex; justify-content: space-between; align-items: center; }
+  header h1 { margin: 0; font-size: 20px; letter-spacing: 0.5px; }
+  header h1 span { color: #8a8a98; font-weight: 400; }
+  .credits { background: #1a1a24; border: 1px solid #b08d57; color: #e8c97a; padding: 8px 16px; border-radius: 999px; font-weight: 600; }
+  main { display: grid; grid-template-columns: 380px 1fr; height: calc(100vh - 73px); }
+  .panel { padding: 24px; border-right: 1px solid #2a2a35; display: flex; flex-direction: column; gap: 12px; overflow-y: auto; }
+  textarea { width: 100%; min-height: 140px; background: #14141d; color: #f0e9d8; border: 1px solid #3a3a48; border-radius: 10px; padding: 12px; font-size: 14px; resize: vertical; font-family: inherit; }
+  button { background: #b08d57; color: #14100a; border: none; border-radius: 10px; padding: 12px; font-size: 15px; font-weight: 700; cursor: pointer; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  #log { background: #101018; border: 1px solid #2a2a35; border-radius: 10px; padding: 12px; font-family: monospace; font-size: 12px; white-space: pre-wrap; max-height: 300px; overflow-y: auto; flex: 1; }
+  #log .error { color: #ff9a9a; }
+  .hint { font-size: 12px; color: #8a8a98; }
+  .preview-wrap { display: flex; flex-direction: column; min-height: 0; }
+  .preview-bar { padding: 10px 20px; border-bottom: 1px solid #2a2a35; font-size: 13px; color: #8a8a98; }
+  iframe { width: 100%; height: 100%; border: none; background: #fff; flex: 1; }
+  @media (max-width: 800px) {
+    main { grid-template-columns: 1fr; height: auto; }
+    .panel { border-right: none; border-bottom: 1px solid #2a2a35; }
+    iframe { min-height: 60vh; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>AI Website Builder <span>— backend demo</span></h1>
+  <div class="credits"><span id="credits">…</span> credits</div>
+</header>
+<main>
+  <div class="panel">
+    <label for="prompt"><strong>Describe the site to build</strong></label>
+    <textarea id="prompt" placeholder="A luxury landing page for a coffee brand with an online menu…"></textarea>
+    <button id="build">Build it</button>
+    <div class="hint">First visit starts you with 25 free credits. Each build costs 10 credits. Generation streams live below.</div>
+    <div id="log">Build log will appear here…</div>
+  </div>
+  <div class="preview-wrap">
+    <div class="preview-bar">Live preview &nbsp;<button id="publishBtn" disabled style="width:auto;padding:6px 14px;font-size:13px;">Publish site</button> <span id="publishUrl" style="font-size:13px;"></span></div>
+    <iframe id="preview" title="Generated site preview" sandbox="allow-scripts"></iframe>
+  </div>
+</main>
+<script>
+  const logEl = document.getElementById("log");
+  const creditsEl = document.getElementById("credits");
+  const buildBtn = document.getElementById("build");
+  const promptEl = document.getElementById("prompt");
+  const previewEl = document.getElementById("preview");
+  const publishBtn = document.getElementById("publishBtn");
+  const publishUrl = document.getElementById("publishUrl");
+  let lastHtml = "";
+
+  // Stable anonymous user id (replace with real auth in production).
+  let userId = localStorage.getItem("builder_user_id");
+  if (!userId) {
+    userId = "u_" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+    localStorage.setItem("builder_user_id", userId);
+  }
+
+  async function refreshCredits() {
+    try {
+      const r = await fetch("/api/credits?userId=" + encodeURIComponent(userId));
+      const d = await r.json();
+      creditsEl.textContent = d.credits;
+    } catch { creditsEl.textContent = "?"; }
+  }
+
+  function log(msg, isError) {
+    const div = document.createElement("div");
+    if (isError) div.className = "error";
+    div.textContent = msg;
+    logEl.appendChild(div);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  buildBtn.addEventListener("click", async () => {
+    const prompt = promptEl.value.trim();
+    if (prompt.length < 3) { log("Describe what to build first.", true); return; }
+    buildBtn.disabled = true;
+    logEl.innerHTML = "";
+    log("Starting build…");
+
+    try {
+      const res = await fetch("/api/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt, userId }),
+      });
+
+      if (res.status === 402) {
+        log("Out of credits — top up to keep building.", true);
+        buildBtn.disabled = false;
+        return;
+      }
+      if (!res.ok || !res.body) {
+        const d = await res.json().catch(() => ({}));
+        log(d.error || "Request failed.", true);
+        buildBtn.disabled = false;
+        return;
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let eventName = "message";
+      const streamBox = document.createElement("div");
+      log("Streaming…");
+      logEl.appendChild(streamBox);
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop();
+        for (const part of parts) {
+          let data = "";
+          for (const line of part.split("\n")) {
+            if (line.startsWith("event:")) eventName = line.slice(6).trim();
+            else if (line.startsWith("data:")) data += line.slice(5).trim();
+          }
+          if (!data) continue;
+          const payload = JSON.parse(data);
+          if (eventName === "delta") {
+            streamBox.textContent += payload.text;
+            logEl.scrollTop = logEl.scrollHeight;
+          } else if (eventName === "start") {
+            creditsEl.textContent = payload.credits;
+            log("Credits remaining: " + payload.credits);
+          } else if (eventName === "done") {
+            previewEl.srcdoc = payload.html;
+            lastHtml = payload.html;
+            publishBtn.disabled = false;
+            publishUrl.textContent = "";
+            creditsEl.textContent = payload.credits;
+            log("Done! Preview updated. Credits: " + payload.credits);
+          } else if (eventName === "error") {
+            log(payload.error || "Generation error.", true);
+          }
+        }
+      }
+    } catch (e) {
+      log("Network error: " + e.message, true);
+    }
+    buildBtn.disabled = false;
+    refreshCredits();
+  });
+
+  publishBtn.addEventListener("click", async () => {
+    if (!lastHtml) return;
+    publishBtn.disabled = true;
+    publishUrl.textContent = "Publishing…";
+    try {
+      const r = await fetch("/api/publish", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          userId,
+          html: lastHtml,
+          title: promptEl.value.trim().slice(0, 80) || "Untitled site",
+        }),
+      });
+      const d = await r.json();
+      if (d.ok) {
+        const full = location.origin + d.url;
+        publishUrl.innerHTML =
+          'Live at <a href="' + d.url + '" target="_blank" rel="noopener">' + full + "</a>" +
+          (d.domain
+            ? '<br>Free domain: <a href="' + d.domain + '" target="_blank" rel="noopener">' + d.domain + "</a>"
+            : '<br><span style="color:#8a8a98">Free subdomain available once a site domain is configured</span>');
+      } else {
+        publishUrl.textContent = d.error || "Publish failed.";
+        publishBtn.disabled = false;
+      }
+    } catch (e) {
+      publishUrl.textContent = "Publish failed: " + e.message;
+      publishBtn.disabled = false;
+    }
+  });
+
+  refreshCredits();
+</script>
+</body>
+</html>

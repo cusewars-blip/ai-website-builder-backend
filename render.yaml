@@ -1,0 +1,24 @@
+# Render Blueprint for the AI Website Builder backend.
+# Deploy: push this repo to GitHub, then in Render Dashboard -> New -> Blueprint,
+# point it at the repo. Render reads this file and creates the service.
+services:
+  - type: web
+    name: ai-website-builder-backend
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: AI_PROVIDER
+        value: gemini
+      - key: GEMINI_MODEL
+        value: gemini-3.8-flash
+      - key: GEMINI_FALLBACK_MODEL
+        value: gemini-flash-lite-latest
+      - key: AI_TIMEOUT_MS
+        value: 120000
+      # --- set these in the Render dashboard (never commit secrets) ---
+      # GEMINI_API_KEY: paste your Google AI Studio key
+      # CORS_ORIGIN: https://muse.ai  (your frontend origin; comma-separated if more than one)
+      # SITES_DOMAIN: yourdomain.com  (only when you own a domain + wildcard DNS)
