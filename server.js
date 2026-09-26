@@ -43,6 +43,7 @@ const MAX_TOKENS = parseInt(process.env.MAX_TOKENS || "20000", 10);
 const FREE_CREDITS = parseInt(process.env.FREE_CREDITS || "25", 10); // free credits for new users
 const CREDITS_PER_BUILD = parseFloat(process.env.CREDITS_PER_BUILD || "1"); // cost of one full generation
 const CREDITS_PER_REFINEMENT = parseFloat(process.env.CREDITS_PER_REFINEMENT || "0.5"); // cost of a follow-up correction
+const BOOT_TIME = new Date().toISOString(); // when this process started (build/deploy provenance for probes)
 
 function providerReady() {
   return AI_PROVIDER === "gemini" ? !!GEMINI_API_KEY : !!ANTHROPIC_API_KEY;
@@ -1147,6 +1148,8 @@ app.get("/api/health", (req, res) => {
     upkeepDays: UPKEEP_DAYS,
     googleSignIn: googleConfigured(),
     auth: true,
+    deployedCommit: process.env.RENDER_GIT_COMMIT || "unknown",
+    bootTime: BOOT_TIME,
   });
 });
 
@@ -1545,26 +1548,31 @@ app.get("/api/credits/history", (req, res) => {
 // successful 100-credit purchase. Grants the credits plus the every-3rd-purchase
 // 150 bonus.
 //
-// SECURITY: set PURCHASE_WEBHOOK_SECRET on the server (Render env vars) and pass
-// it as the `x-webhook-secret` header (or `webhookSecret` body/query field).
-// While the secret is unset, the endpoint keeps its old behavior — but anyone
-// can mint 100 credits per call. Set the secret before wiring real payments.
+// SECURITY (deny-by-default): this endpoint is DISABLED until
+// PURCHASE_WEBHOOK_SECRET is set on the server (Render env vars). Calls must
+// pass the secret as the `x-webhook-secret` header (or `webhookSecret`
+// body/query field). Without the secret configured, no one can mint credits.
 let purchaseSecretWarned = false;
 app.post("/api/purchase", (req, res) => {
   const secret = process.env.PURCHASE_WEBHOOK_SECRET;
-  if (secret) {
-    const provided =
-      req.get("x-webhook-secret") ||
-      (req.body && req.body.webhookSecret) ||
-      req.query.webhookSecret;
-    if (provided !== secret) {
-      return res.status(403).json({ error: "Purchase verification required." });
+  if (!secret) {
+    if (!purchaseSecretWarned) {
+      purchaseSecretWarned = true;
+      console.warn(
+        "[purchase] PURCHASE_WEBHOOK_SECRET not set — /api/purchase disabled (deny-by-default)."
+      );
     }
-  } else if (!purchaseSecretWarned) {
-    purchaseSecretWarned = true;
-    console.warn(
-      "[purchase] PURCHASE_WEBHOOK_SECRET not set — /api/purchase is unprotected."
-    );
+    return res.status(503).json({
+      error:
+        "Purchases are disabled until PURCHASE_WEBHOOK_SECRET is configured on the server.",
+    });
+  }
+  const provided =
+    req.get("x-webhook-secret") ||
+    (req.body && req.body.webhookSecret) ||
+    req.query.webhookSecret;
+  if (provided !== secret) {
+    return res.status(403).json({ error: "Purchase verification required." });
   }
   const identity = resolveIdentity(req);
   if (!identity) return res.status(400).json({ error: "Valid userId required." });
@@ -1599,6 +1607,141 @@ app.post("/api/admin/grant-credits", (req, res) => {
   if (!user) return res.status(404).json({ error: "No account with that email." });
   const result = acctRecordPurchase(user.id);
   res.json({ ok: true, email: user.email, ...result });
+});
+
+// ---- PayPal webhook: fully automatic payment processing ----
+// Cody takes $12.99 via PayPal payment links. This endpoint lets PayPal call
+// home the moment money lands, so Cody drops out of the loop entirely:
+//   PayPal pays --> POST /api/webhooks/paypal --> signature verified -->
+//   100 credits granted to the buyer's account --> Cody's tab notified.
+// Setup (all in PayPal, no code needed beyond this):
+//   1. developer.paypal.com -> Apps & Credentials -> Create App (Live mode)
+//   2. App -> Webhooks -> Add Webhook:
+//      URL: https://<backend>/api/webhooks/paypal
+//      Events: PAYMENT.CAPTURE.COMPLETED, PAYMENT.SALE.COMPLETED (payment links),
+//              PAYMENT.CAPTURE.REFUNDED (fraud/chargeback flag)
+//   3. Copy the Webhook ID, Client ID, Client Secret into Render env vars:
+//      PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET, PAYPAL_WEBHOOK_ID
+//      (PAYPAL_MODE=sandbox for testing; live by default)
+// Disabled (503) until the three env vars are set. Every event is verified
+// with PayPal's verify-webhook-signature API before any credit is granted.
+const PAYPAL_WEBHOOK_ID = () => process.env.PAYPAL_WEBHOOK_ID;
+const PAYPAL_MODE = () => (process.env.PAYPAL_MODE || "live").toLowerCase();
+const paypalApiBase = () =>
+  PAYPAL_MODE() === "sandbox"
+    ? "https://api-m.sandbox.paypal.com"
+    : "https://api-m.paypal.com";
+let paypalTokenCache = null; // { token, exp }
+async function paypalAccessToken() {
+  const cid = process.env.PAYPAL_CLIENT_ID, sec = process.env.PAYPAL_CLIENT_SECRET;
+  if (!cid || !sec) return null;
+  if (paypalTokenCache && paypalTokenCache.exp > Date.now() + 60000)
+    return paypalTokenCache.token;
+  const r = await fetch(paypalApiBase() + "/v1/oauth2/token", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Authorization: "Basic " + Buffer.from(cid + ":" + sec).toString("base64"),
+    },
+    body: "grant_type=client_credentials",
+  });
+  if (!r.ok) return null;
+  const j = await r.json();
+  paypalTokenCache = { token: j.access_token, exp: Date.now() + (j.expires_in || 300) * 1000 };
+  return paypalTokenCache.token;
+}
+async function verifyPaypalWebhook(req, rawBody) {
+  try {
+    const token = await paypalAccessToken();
+    if (!token) return false;
+    const r = await fetch(paypalApiBase() + "/v1/notifications/verify-webhook-signature", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
+      body: JSON.stringify({
+        transmission_id: req.get("paypal-transmission-id"),
+        transmission_time: req.get("paypal-transmission-time"),
+        cert_url: req.get("paypal-cert-url"),
+        auth_algo: req.get("paypal-auth-algo"),
+        transmission_sig: req.get("paypal-transmission-sig"),
+        webhook_id: PAYPAL_WEBHOOK_ID(),
+        webhook_event: JSON.parse(rawBody),
+      }),
+    });
+    if (!r.ok) return false;
+    return (await r.json()).verification_status === "SUCCESS";
+  } catch { return false; }
+}
+const PAYPAL_EVENTS_PATH = path.join(__dirname, "paypal-events.json");
+function loadPaypalEvents() {
+  try { const e = JSON.parse(fs.readFileSync(PAYPAL_EVENTS_PATH, "utf8")); return Array.isArray(e) ? e : []; }
+  catch { return []; }
+}
+function paypalEventSeen(id) {
+  const seen = loadPaypalEvents();
+  if (seen.includes(id)) return true;
+  seen.push(id);
+  try { fs.writeFileSync(PAYPAL_EVENTS_PATH, JSON.stringify(seen.slice(-500))); } catch {}
+  return false;
+}
+const CREDIT_PACK_PRICE = 12.99, CREDIT_PACK_CREDITS = 100;
+// Internal: drop a message into Cody's chat queue (shows in his "Use Muse" tab).
+function beaconNotify(from, text) {
+  try {
+    const q = loadBeaconQueue();
+    q.messages.push({
+      id: crypto.randomBytes(8).toString("hex"),
+      from, text: String(text).slice(0, 1000),
+      at: new Date().toISOString(), status: "unread",
+    });
+    saveBeaconQueue(q);
+  } catch {}
+}
+app.post("/api/webhooks/paypal", express.raw({ type: "application/json", limit: "1mb" }), async (req, res) => {
+  if (!process.env.PAYPAL_CLIENT_ID || !process.env.PAYPAL_CLIENT_SECRET || !PAYPAL_WEBHOOK_ID())
+    return res.status(503).json({ error: "PayPal webhook not configured (set PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET, PAYPAL_WEBHOOK_ID)." });
+  const rawBody = req.body ? req.body.toString("utf8") : "";
+  if (!rawBody) return res.status(400).json({ error: "Empty body." });
+  if (!(await verifyPaypalWebhook(req, rawBody))) {
+    console.warn("[paypal] webhook signature verification FAILED — ignored.");
+    return res.status(401).json({ error: "Invalid signature." });
+  }
+  let event;
+  try { event = JSON.parse(rawBody); } catch { return res.status(400).json({ error: "Bad JSON." }); }
+  if (paypalEventSeen(event.id)) return res.json({ ok: true, deduped: true });
+  const res_ = event.resource || {};
+  const type = event.event_type || "";
+  console.log("[paypal] event:", type, "id:", event.id);
+  if (type === "PAYMENT.CAPTURE.REFUNDED" || type === "PAYMENT.CAPTURE.REVERSED") {
+    beaconNotify("beacon", `⚠️ PayPal refund/chargeback on ${res_.id || "a payment"} — review the account manually before re-granting anything.`);
+    return res.json({ ok: true, noted: "refund" });
+  }
+  if (type !== "PAYMENT.CAPTURE.COMPLETED" && type !== "PAYMENT.SALE.COMPLETED")
+    return res.json({ ok: true, ignored: type });
+  const amount = parseFloat((res_.amount && res_.amount.value) || "0");
+  const currency = (res_.amount && res_.amount.currency_code) || "";
+  const payerEmail = (
+    (res_.payer && res_.payer.email_address) ||
+    (event.payer && event.payer.email_address) ||
+    ""
+  ).toLowerCase();
+  if (currency !== "USD" || amount < CREDIT_PACK_PRICE) {
+    console.warn("[paypal] unexpected amount/currency:", amount, currency, "— held for manual review.");
+    beaconNotify("beacon", `⚠️ PayPal paid ${amount} ${currency} (expected $${CREDIT_PACK_PRICE}) from ${payerEmail || "unknown"} — held for manual review, no credits granted.`);
+    return res.json({ ok: true, held: "amount" });
+  }
+  // Attribution: prefer exact custom_id (buyer account id set when the payment link
+  // was generated) over fuzzy payer-email matching. Email stays as the fallback.
+  const customId = String(res_.custom_id || "").trim();
+  const users = loadUsers();
+  let user = (customId && users[customId]) || null;
+  if (!user && payerEmail && validEmail(payerEmail)) user = findUserByEmail(payerEmail);
+  if (!user) {
+    beaconNotify("beacon", `💰 PayPal received $${amount.toFixed(2)} from ${payerEmail || "unknown email"} — but no builder account uses that email${customId ? " or custom_id " + customId : ""}. Match them manually and grant credits.`);
+    return res.json({ ok: true, pending: "no-account" });
+  }
+  const grant = acctRecordPurchase(user.id);
+  beaconNotify("beacon", `💰 Payment received! $${amount.toFixed(2)} via PayPal from ${payerEmail} — ${grant.creditsAdded} credits granted${grant.bonus ? " (includes 150 bonus!)" : ""}. Account: ${user.email}.`);
+  res.json({ ok: true, email: user.email, ...grant });
 });
 
 // Publish a generated site and get a public URL back.
