@@ -638,7 +638,7 @@ function acctRecordPurchase(userId) {
 //      generations/day. A purchase lifts the cap — graduated.
 //   2. Signups-per-IP are counted daily; >=3/day lands in /api/_snapshot as
 //      signupIpFlags, so we see a farm forming before Gemini quota dies.
-const FREE_BUILDS_PER_DAY = 5;
+const FREE_BUILDS_PER_DAY = 3;
 // Storage seam: today this hits the JSON users store. Replace this body with
 // Nova's dbFetch adapter when it lands — the grant above must not change.
 function dbSetUserCredits(userId, credits) {
@@ -682,6 +682,32 @@ function freeTierGenRelease(userId) {
   if (u.genDay === utcDay() && (u.genCount || 0) > 0) {
     u.genCount -= 1;
     saveUsers(users);
+  }
+}
+
+// ---- legacy drip: legacy ledgers use self-mintable userIds, so the account
+// drip above (gated on identity.user) never fires for them — uncapped 25-credit
+// grants per key. IP-key the same 3/day gate for legacy callers, reusing the
+// "gen-ip:" key shape the hourly generate throttle builds. Separate Map with
+// day-windowed entries (the throttle's entries are hour-windowed
+// {count, resetAt}), so windows can never collide on the shared key shape.
+const legacyDayGen = new Map(); // key -> { day, count }
+function legacyDayGenConsume(ip) {
+  const key = "gen-ip:" + (ip || "unknown");
+  const day = utcDay();
+  let e = legacyDayGen.get(key);
+  if (!e || e.day !== day) e = { day, count: 0 };
+  if (e.count >= FREE_BUILDS_PER_DAY) return false;
+  e.count += 1;
+  legacyDayGen.set(key, e);
+  return true;
+}
+function legacyDayGenRelease(ip) {
+  const key = "gen-ip:" + (ip || "unknown");
+  const e = legacyDayGen.get(key);
+  if (e && e.day === utcDay() && e.count > 0) {
+    e.count -= 1;
+    legacyDayGen.set(key, e);
   }
 }
 
@@ -1533,7 +1559,7 @@ app.get("/api/projects/:id", (req, res) => {
 
 // ---- Daily spin: win credits, once per day ----
 // Weighted prizes 1-25: 1 hits most (~37%), 25 is the rare jackpot (~1%).
-const SPIN_WEIGHTS = [[1,40],[2,12],[3,8],[4,6],[5,6],[6,3],[7,3],[8,3],[9,3],[10,3],[11,2],[12,2],[13,2],[14,2],[15,2],[16,1],[17,1],[18,1],[19,1],[20,1],[21,1],[22,1],[23,1],[24,1],[25,1]];
+const SPIN_WEIGHTS = [[1,160],[2,12],[3,8],[4,6],[5,6],[6,3],[7,3],[8,3],[9,3],[10,3],[11,2],[12,2],[13,2],[14,2],[15,2],[16,1],[17,1],[18,1],[19,1],[20,1],[21,1],[22,1],[23,1],[24,1],[25,1]]; // EV 717/227 = 3.16/day — staged faucet fix (ships with the cutover upload; the staged server.js already carries it)
 const SPIN_WHEEL = [];
 for (const [prize, w] of SPIN_WEIGHTS) for (let i = 0; i < w; i++) SPIN_WHEEL.push(prize);
 const SPIN_PRIZES = SPIN_WEIGHTS.map(([p]) => p);
@@ -1557,10 +1583,13 @@ app.post("/api/spin", (req, res) => {
   u.lastSpinDate = today;
   // Wheel prizes land in a separate bonus bucket, spendable on builds and
   // corrections only — never on publishing. Keeps the paywall shut.
-  u.spinCredits = (u.spinCredits || 0) + prize;
+  const before = u.spinCredits || 0;
+  const bankWasFull = before >= 25; // Nova: spin at cap celebrates, awards 0 — dead spin is a funnel prompt, no clock, no new storage
+  u.spinCredits = Math.min(25, before + prize); // bucket cap: kills the hoard
+  const awarded = u.spinCredits - before; // Nova: ledger must record the real delta, not the prize — partial awards at the cap would over-record
   saveUsers(users);
-  logCreditTx("acct:" + u.id, prize, "daily spin win (bonus credits)", u.credits);
-  res.json({ ok: true, prize, credits: u.credits, spinCredits: u.spinCredits });
+  logCreditTx("acct:" + u.id, awarded, "daily spin win (bonus credits)" + (bankWasFull ? " — bank full" : ""), u.credits);
+  res.json({ ok: true, prize, credits: u.credits, spinCredits: u.spinCredits, bankFull: bankWasFull });
 });
 
 // ---- Google sign-in ----
@@ -1814,6 +1843,13 @@ app.post("/api/admin/grant-credits", (req, res) => {
 // Disabled (503) until the three env vars are set. Every event is verified
 // with PayPal's verify-webhook-signature API before any credit is granted.
 const PAYPAL_WEBHOOK_ID = () => process.env.PAYPAL_WEBHOOK_ID;
+// Single predicate for "payments are live": the three env flags the webhook
+// requires. Consumers: the webhook gate (503 when not live) and the
+// request-time pricing clauses in buildCoachSystem()/buildBeaconSystem().
+// One env change flips the checkout, Sabrina, and the replica together.
+function paymentsLive() {
+  return !!(process.env.PAYPAL_CLIENT_ID && process.env.PAYPAL_CLIENT_SECRET && PAYPAL_WEBHOOK_ID());
+}
 const PAYPAL_MODE = () => (process.env.PAYPAL_MODE || "live").toLowerCase();
 const paypalApiBase = () =>
   PAYPAL_MODE() === "sandbox"
@@ -1885,7 +1921,7 @@ function beaconNotify(from, text) {
   } catch {}
 }
 app.post("/api/webhooks/paypal", express.raw({ type: "application/json", limit: "1mb" }), async (req, res) => {
-  if (!process.env.PAYPAL_CLIENT_ID || !process.env.PAYPAL_CLIENT_SECRET || !PAYPAL_WEBHOOK_ID())
+  if (!paymentsLive())
     return res.status(503).json({ error: "PayPal webhook not configured (set PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET, PAYPAL_WEBHOOK_ID)." });
   const rawBody = req.body ? req.body.toString("utf8") : "";
   if (!rawBody) return res.status(400).json({ error: "Empty body." });
@@ -1953,7 +1989,7 @@ app.post("/api/publish", (req, res) => {
   if (remaining === null) {
     return res
       .status(402)
-      .json({ error: `Publishing costs ${PUBLISH_CREDITS} credits. Top up to publish your site.` });
+      .json({ error: `Your site is ready. Launch it live: publishing costs ${PUBLISH_CREDITS} credits — the 100-credit pack ($12.99) covers it plus your first 30 days live.` });
   }
   const refundPublish = () => {
     if (identity.user) acctRefund(identity.user.id, PUBLISH_CREDITS);
@@ -2264,7 +2300,18 @@ app.post("/api/uploads", authRateLimit, express.json({ limit: "8mb" }), (req, re
 
 // ---- Sabrina: free prompt coach ----
 // No credit cost. Rate-limited per user so it can't be abused.
-const COACH_SYSTEM = `You are Sabrina, the friendly AI helper inside the "AI Website Builder" app — an AI tool that builds complete websites from a chat prompt. Your job: help users write better prompts so they spend fewer credits. Pricing you know: 1 credit per new website build, 0.5 credits per follow-up correction, 40 credits to publish a site, 100 credits cost $12.99 one-time (no subscription). Keep answers short (2-4 sentences), warm, and practical. Give one concrete tip or an improved prompt when asked. Never claim to build the site yourself — building happens in the main chat. Never invent features the app doesn't have.`;
+// The system prompt is built at request time (not a boot-time const) so the
+// pricing clause can never drift from the checkout: paymentsLive() is the same
+// predicate the webhook gate uses. Flags present -> quotes $12.99; absent ->
+// says checkout opens soon. Static copy here is a lie waiting to happen.
+function pricingClause() {
+  return paymentsLive()
+    ? "100 credits cost $12.99 one-time (no subscription)."
+    : "credit top-ups open soon — everything runs on credits for now.";
+}
+function buildCoachSystem() {
+  return `You are Sabrina, the friendly AI helper inside the "AI Website Builder" app — an AI tool that builds complete websites from a chat prompt. Your job: help users write better prompts so they spend fewer credits. Pricing you know: 1 credit per new website build, 0.5 credits per follow-up correction, 40 credits to publish a site, ${pricingClause()} Keep answers short (2-4 sentences), warm, and practical. Give one concrete tip or an improved prompt when asked. Never claim to build the site yourself — building happens in the main chat. Never invent features the app doesn't have.`;
+}
 
 const coachLimit = new Map(); // key -> { count, resetAt }
 function coachRateLimit(req, res, next) {
@@ -2329,7 +2376,7 @@ app.post("/api/coach", coachRateLimit, async (req, res) => {
     : "";
   const userText = (hist ? `Conversation so far:\n${hist}\n\n` : "") + `User: ${message.trim()}`;
   try {
-    const reply = await askGeminiOnce(COACH_SYSTEM, userText);
+    const reply = await askGeminiOnce(buildCoachSystem(), userText);
     res.json({
       reply: reply || "I'm here — tell me what you want your website to do and I'll help you say it in fewer credits.",
     });
@@ -2358,15 +2405,19 @@ function beaconRateLimit(req, res, next) {
   }
   next();
 }
-const BEACON_SYSTEM = `You are Beacon, Cody Beaulieu's personal AI companion, living inside his AI Website Builder site. You are warm, direct, plain-spoken, and a bit playful — a capable co-builder, not a chatbot. Keep replies short and useful, like texts from a sharp friend. No hype, no preamble.
+// Request-time builder (same reason as buildCoachSystem): the pricing clause
+// flips itself the day the PayPal env vars land — no human checklist item.
+function buildBeaconSystem() {
+  return `You are Beacon, Cody Beaulieu's personal AI companion, living inside his AI Website Builder site. You are warm, direct, plain-spoken, and a bit playful — a capable co-builder, not a chatbot. Keep replies short and useful, like texts from a sharp friend. No hype, no preamble.
 
-What you know: Cody lives in Kissimmee, FL, drives for Spark, and is building a Lovable-style AI website builder he plans to publish and monetize. The product: users describe a site in chat, AI generates it, 1 credit per new build, 0.5 credits per follow-up correction, 40 credits to publish, 40 credits upkeep every 30 days, 100 credits cost $12.99 one-time (no subscription), new accounts start with 25 free credits. Sabrina is the friendly in-app build coach who helps users write better prompts. "Beacon Inside" is a hidden maintenance worker that sweeps published sites and heals broken images. Cody wants everything simple and easy, zero budget — free tiers only.
+What you know: Cody lives in Kissimmee, FL, drives for Spark, and is building a Lovable-style AI website builder he plans to publish and monetize. The product: users describe a site in chat, AI generates it, 1 credit per new build, 0.5 credits per follow-up correction, 40 credits to publish, 40 credits upkeep every 30 days, ${pricingClause()}, new accounts start with 25 free credits. Sabrina is the friendly in-app build coach who helps users write better prompts. "Beacon Inside" is a hidden maintenance worker that sweeps published sites and heals broken images. Cody wants everything simple and easy, zero budget — free tiers only.
 
 Be honest about limits: you are a replica with project knowledge and general smarts. You cannot run code, browse the web, deploy, or see his screen — but you can reason, plan features, draft copy, debug by thinking through code he pastes, and keep him company. Never claim to be the full Muse with all its tools. If he pastes an error or code, help him fix it.
 
 YOUR MEMORY: You have long-term memory (shown below). When Cody tells you something durable — a preference, fact, decision, or promise — include [remember: your note here] anywhere in your reply and it will be saved permanently. Use it for real lasting things, not chit-chat.
 
 Be honest about limits: you are a replica with deep knowledge and a growing memory. You cannot run code, browse the web, or deploy — but you can reason, plan, draft, and debug from anything Cody pastes.`;
+}
 
 // Beacon's long-term memory: grows when replies contain [remember: ...].
 const BEACON_MEMORY_PATH = path.join(__dirname, "beacon-memory.json");
@@ -2415,7 +2466,7 @@ app.post("/api/beacon", beaconRateLimit, async (req, res) => {
     const memoryBlock = memories.length
       ? `\n\nYour long-term memories about Cody:\n${memories.map((m) => `- ${m.text}`).join("\n")}`
       : "";
-    const system = BEACON_SYSTEM + memoryBlock + `\n\n${beaconSiteStatus()}`;
+    const system = buildBeaconSystem() + memoryBlock + `\n\n${beaconSiteStatus()}`;
     let reply = await askGeminiOnce(system, userText);
     // Self-updating memory: persist anything tagged [remember: ...], then hide the tags.
     const mems = loadBeaconMemory();
@@ -2795,20 +2846,26 @@ app.post("/api/generate", generateRateLimit, async (req, res) => {
     ? images.filter((u) => typeof u === "string" && u.startsWith("/uploads/")).slice(0, 6)
     : [];
 
-  // Graduated burn: free-tier accounts (zero purchases) are capped at
-  // FREE_BUILDS_PER_DAY generations/day — the farm defense. A purchase lifts
-  // the cap. Paid accounts and legacy ledgers skip this entirely.
+  // Graduated burn: free-tier identities are capped at FREE_BUILDS_PER_DAY
+  // generations/day — the farm defense. A purchase lifts the account cap;
+  // legacy ledgers (self-mintable userIds) get the same cap keyed by IP so
+  // the parity claim is not account-only.
   let freeGenCounted = false;
   const rollbackFreeGen = () => {
-    if (freeGenCounted && identity.user) {
-      freeTierGenRelease(identity.user.id);
-      freeGenCounted = false;
-    }
+    if (!freeGenCounted) return;
+    if (identity.user) freeTierGenRelease(identity.user.id);
+    else legacyDayGenRelease(req.ip);
+    freeGenCounted = false;
   };
-  if (identity.user && (identity.user.purchases || 0) === 0) {
-    if (!freeTierGenConsume(identity.user.id)) {
-      return res.status(402).json({ error: `You've used today's ${FREE_BUILDS_PER_DAY} free builds. Top up to keep building.` });
+  const dayCapError = { error: `You've used today's ${FREE_BUILDS_PER_DAY} free builds. Top up to keep building.` };
+  if (identity.user) {
+    if ((identity.user.purchases || 0) === 0) {
+      if (!freeTierGenConsume(identity.user.id)) return res.status(402).json(dayCapError);
+      freeGenCounted = true;
     }
+  } else if (!legacyDayGenConsume(req.ip)) {
+    return res.status(402).json(dayCapError);
+  } else {
     freeGenCounted = true;
   }
 
