@@ -616,6 +616,17 @@ function hasSubstantialCss(html) {
   return cssText.length > 1500;
 }
 
+// Quality gate part 2: the model sometimes writes plenty of CSS but forgets
+// to style links, leaving default blue underlined browser links. Detect it:
+// if the page has <a> tags but no CSS rule targeting anchors, it fails.
+function hasStyledLinks(html) {
+  if (!/<a[\s>]/i.test(html)) return true; // no links, nothing to style
+  const m = html.match(/<style[^>]*>([\s\S]*?)<\/style>/i);
+  if (!m) return false;
+  const css = m[1].replace(/\/\*[\s\S]*?\*\//g, "");
+  return /(^|[\s,{}>+~])a([\s.:#[{,>+~]|$)/m.test(css);
+}
+
 async function continueGeneration(partialText, onText) {
   const tail = partialText.slice(-6000);
   const contPrompt =
@@ -1686,16 +1697,21 @@ app.post("/api/generate", async (req, res) => {
       completeHtml = extractHtml(completeText);
     }
     // Quality gate: if the model skipped the CSS (page would render with
-    // default blue links and no layout), regenerate once with an explicit
-    // correction. Never ship an unstyled page to the user.
-    if (!hasSubstantialCss(completeHtml)) {
+    // default blue links and no layout), or styled everything except links
+    // (default blue underlined <a> tags slipping through), regenerate once
+    // with an explicit correction. Never ship an unstyled page to the user.
+    const missingCss = !hasSubstantialCss(completeHtml);
+    const unstyledLinks = !missingCss && !hasStyledLinks(completeHtml);
+    if (missingCss || unstyledLinks) {
       send("status", { message: "Polishing the design..." });
       try {
         const fixPrompt =
-          "Your last website output was missing its CSS styling — it rendered with default browser styles (blue underlined links, no layout). " +
+          (missingCss
+            ? "Your last website output was missing its CSS styling — it rendered with default browser styles (blue underlined links, no layout). "
+            : "Your last website output styled the page but left its LINKS unstyled — they rendered as default blue underlined browser links, which is a failure. ") +
           "Regenerate the COMPLETE website from scratch as a single HTML document. This time you MUST include a comprehensive <style> block in the <head> " +
-          "styling every element: CSS reset, styled links (never default blue underlines), buttons, nav, hero, cards, sections, footer, responsive rules. " +
-          "A page without substantial CSS is a total failure. Output ONLY the raw HTML, no explanations.\n\nOriginal request:\n" + buildPrompt;
+          "styling every element: CSS reset, EVERY <a> link with an explicit color and no default blue underline (deliberate hover styles only), buttons, nav, hero, cards, sections, footer, responsive rules. " +
+          "A page with default blue underlined links anywhere is a total failure. Output ONLY the raw HTML, no explanations.\n\nOriginal request:\n" + buildPrompt;
         const retryText =
           AI_PROVIDER === "gemini"
             ? await streamGemini(fixPrompt, () => {})
@@ -1710,8 +1726,8 @@ app.post("/api/generate", async (req, res) => {
           }
           retryHtml = extractHtml(retryComplete);
         }
-        // Use the retry only if it's actually better (complete + styled).
-        if (isCompleteHtml(retryHtml) && hasSubstantialCss(retryHtml)) {
+        // Use the retry only if it's actually better (complete + styled + links styled).
+        if (isCompleteHtml(retryHtml) && hasSubstantialCss(retryHtml) && hasStyledLinks(retryHtml)) {
           completeHtml = retryHtml;
         }
       } catch (e) {
