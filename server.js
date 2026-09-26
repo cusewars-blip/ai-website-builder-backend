@@ -194,6 +194,8 @@ app.use((req, res, next) => {
   res.sendFile(file);
 });
 
+// Builder UI at the site root: same-origin with /api, so sign-in cookies work.
+app.get("/", (req, res) => res.sendFile(path.join(__dirname, "index.html")));
 app.use(express.static(path.join(__dirname, "public"))); // demo client
 
 // Expired sites show a "paused" page instead of their content.
