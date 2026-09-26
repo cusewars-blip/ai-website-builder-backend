@@ -714,6 +714,16 @@ function signupIpFlags(day) {
     .sort((a, b) => b.count - a.count);
 }
 
+// Hard enforcement (Nova): cap signups per IP per day. 3/day is generous for
+// a household; anything above is a farm burning Gemini quota and free builds.
+const SIGNUP_IP_DAILY_CAP = 3;
+function signupIpOverLimit(ip) {
+  const day = utcDay();
+  let rec = {};
+  try { rec = JSON.parse(fs.readFileSync(SIGNUP_IPS_PATH, "utf8")); } catch {}
+  return ((rec[day] || {})[ip] || 0) >= SIGNUP_IP_DAILY_CAP;
+}
+
 // ---- the build instructions sent to the AI ----
 const SYSTEM_PROMPT = `You are an elite front-end developer and product designer. Your sites must match or beat what GoDaddy's website builder produces — professional, complete, business-ready websites that look like a top agency charged thousands of dollars for them.
 
@@ -1326,6 +1336,10 @@ app.post("/api/auth/signup", signupRateLimit, async (req, res) => {
     return res.status(400).json({ error: "Password must be at least 8 characters." });
   }
   const normEmail = email.trim().toLowerCase();
+  const ip = req.ip || "?";
+  if (signupIpOverLimit(ip)) {
+    return res.status(429).json({ error: "Too many signups from this network today. Try again tomorrow." });
+  }
   if (findUserByEmail(normEmail)) {
     return res.status(409).json({ error: "An account with that email already exists. Try logging in." });
   }
@@ -1633,6 +1647,7 @@ app.get("/api/auth/google/callback", async (req, res) => {
     }
     let user = findUserByEmail(email);
     if (!user) {
+      if (signupIpOverLimit(req.ip || "?")) return fail("toomany"); // Nova: hard cap farms
       const users = loadUsers();
       const id = crypto.randomBytes(8).toString("hex");
       user = { id, email, hash: null, google: true, credits: 0, purchases: 0, createdAt: Date.now() };
