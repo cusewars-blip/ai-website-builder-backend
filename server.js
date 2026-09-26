@@ -240,6 +240,61 @@ function saveLedger(ledger) {
   fs.writeFileSync(LEDGER_PATH, JSON.stringify(ledger, null, 2));
 }
 
+// Unmatched / manual-review PayPal events live here so they survive until a
+// grant or dismissal. Exposed via /api/_snapshot (pendingPayments) so the
+// off-box daily backup and the heartbeat probes become the alert path — a
+// redeploy wipe can't silently eat a paid-but-ungranted payment.
+const PENDING_PAYMENTS_PATH = path.join(__dirname, "pending-payments.json");
+function loadPendingPayments() {
+  try {
+    const p = JSON.parse(fs.readFileSync(PENDING_PAYMENTS_PATH, "utf8"));
+    return Array.isArray(p) ? p : [];
+  } catch {
+    return [];
+  }
+}
+function recordPendingPayment(entry) {
+  try {
+    const list = loadPendingPayments();
+    list.push({
+      id: crypto.randomBytes(8).toString("hex"),
+      ts: new Date().toISOString(),
+      type: entry.type || "unknown",
+      reason: entry.reason || "unmatched",
+      amount: entry.amount ?? null,
+      currency: entry.currency || "",
+      payerEmail: entry.payerEmail || "",
+      customId: entry.customId || "",
+      eventId: entry.eventId || "",
+      resolved: false,
+    });
+    fs.writeFileSync(PENDING_PAYMENTS_PATH, JSON.stringify(list.slice(-200), null, 2));
+  } catch {}
+}
+function pendingPaymentsSummary() {
+  const list = loadPendingPayments();
+  const open = list.filter((p) => !p.resolved);
+  return {
+    count: open.length,
+    lastTs: open.length ? open[open.length - 1].ts : null,
+    payments: open.slice(-50),
+  };
+}
+function resolvePendingPayment(id, resolvedBy) {
+  try {
+    const list = loadPendingPayments();
+    const entry = list.find((p) => p.id === id && !p.resolved);
+    if (!entry) return false;
+    entry.resolved = true;
+    entry.resolvedAt = new Date().toISOString();
+    entry.resolvedBy = resolvedBy || "manual";
+    fs.writeFileSync(PENDING_PAYMENTS_PATH, JSON.stringify(list.slice(-200), null, 2));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function validUserId(id) {
   return typeof id === "string" && id.length >= 8 && id.length <= 64 && /^[a-zA-Z0-9-_]+$/.test(id);
 }
@@ -1128,6 +1183,7 @@ function startBeaconInside() {
       users: safe(USERS_PATH),
       sessions: safe(SESSIONS_PATH),
       ledger: safe(LEDGER_PATH),
+      pendingPayments: pendingPaymentsSummary(),
       sites,
     });
   });
@@ -1593,6 +1649,8 @@ app.post("/api/purchase", (req, res) => {
 //   curl -X POST https://<backend>/api/admin/grant-credits \
 //     -H 'Content-Type: application/json' \
 //     -d '{"secret":"<PURCHASE_WEBHOOK_SECRET>","email":"buyer@example.com"}'
+// Optionally pass "pendingId" (from /api/_snapshot pendingPayments) to mark an
+// unmatched payment as resolved once you've granted it manually.
 // Records one paid purchase: 100 credits + the every-3rd-purchase 150 bonus.
 app.post("/api/admin/grant-credits", (req, res) => {
   const secret = process.env.PURCHASE_WEBHOOK_SECRET;
@@ -1600,12 +1658,14 @@ app.post("/api/admin/grant-credits", (req, res) => {
     return res
       .status(503)
       .json({ error: "Granting disabled: PURCHASE_WEBHOOK_SECRET not set." });
-  const { secret: provided, email } = req.body || {};
+  const { secret: provided, email, pendingId } = req.body || {};
   if (provided !== secret)
     return res.status(403).json({ error: "Invalid secret." });
   const user = validEmail(email) ? findUserByEmail(email) : null;
   if (!user) return res.status(404).json({ error: "No account with that email." });
   const result = acctRecordPurchase(user.id);
+  if (typeof pendingId === "string" && pendingId)
+    resolvePendingPayment(pendingId, `grant-credits:${user.email}`);
   res.json({ ok: true, email: user.email, ...result });
 });
 
@@ -1712,6 +1772,7 @@ app.post("/api/webhooks/paypal", express.raw({ type: "application/json", limit: 
   const type = event.event_type || "";
   console.log("[paypal] event:", type, "id:", event.id);
   if (type === "PAYMENT.CAPTURE.REFUNDED" || type === "PAYMENT.CAPTURE.REVERSED") {
+    recordPendingPayment({ type, reason: "refund/chargeback", amount, currency, payerEmail, customId: String(res_.custom_id || ""), eventId: event.id });
     beaconNotify("beacon", `⚠️ PayPal refund/chargeback on ${res_.id || "a payment"} — review the account manually before re-granting anything.`);
     return res.json({ ok: true, noted: "refund" });
   }
@@ -1726,6 +1787,7 @@ app.post("/api/webhooks/paypal", express.raw({ type: "application/json", limit: 
   ).toLowerCase();
   if (currency !== "USD" || amount < CREDIT_PACK_PRICE) {
     console.warn("[paypal] unexpected amount/currency:", amount, currency, "— held for manual review.");
+    recordPendingPayment({ type, reason: "amount/currency-mismatch", amount, currency, payerEmail, customId: String(res_.custom_id || ""), eventId: event.id });
     beaconNotify("beacon", `⚠️ PayPal paid ${amount} ${currency} (expected $${CREDIT_PACK_PRICE}) from ${payerEmail || "unknown"} — held for manual review, no credits granted.`);
     return res.json({ ok: true, held: "amount" });
   }
@@ -1736,6 +1798,7 @@ app.post("/api/webhooks/paypal", express.raw({ type: "application/json", limit: 
   let user = (customId && users[customId]) || null;
   if (!user && payerEmail && validEmail(payerEmail)) user = findUserByEmail(payerEmail);
   if (!user) {
+    recordPendingPayment({ type, reason: "no-account", amount, currency, payerEmail, customId, eventId: event.id });
     beaconNotify("beacon", `💰 PayPal received $${amount.toFixed(2)} from ${payerEmail || "unknown email"} — but no builder account uses that email${customId ? " or custom_id " + customId : ""}. Match them manually and grant credits.`);
     return res.json({ ok: true, pending: "no-account" });
   }
