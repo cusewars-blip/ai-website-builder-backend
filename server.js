@@ -627,6 +627,59 @@ function hasStyledLinks(html) {
   return /(^|[\s,{}>+~])a([\s.:#[{,>+~]|$)/m.test(css);
 }
 
+// ---- Self-correcting build engine ("in there, ready at any moment") ----
+// After generation, the builder acts as its own QA engineer: it criticizes
+// the page, surgically repairs each defect with a targeted fix prompt (not a
+// blind full regeneration), re-verifies, and repeats up to MAX_FIX_PASSES.
+// Nothing reaches the user until it passes every check.
+const MAX_FIX_PASSES = 3;
+
+function criticReport(html) {
+  const issues = [];
+  if (!isCompleteHtml(html)) issues.push("incomplete");
+  if (!hasSubstantialCss(html)) issues.push("no-css");
+  else if (/<a[\s>]/i.test(html) && !hasStyledLinks(html)) issues.push("unstyled-links");
+  if (/lorem ipsum/i.test(html)) issues.push("lorem-ipsum");
+  const imgs = html.match(/<img\b[^>]*>/gi) || [];
+  if (imgs.some((t) => !/src\s*=\s*["'][^"']+["']/i.test(t))) issues.push("empty-img-src");
+  return issues;
+}
+
+const FIX_INSTRUCTIONS = {
+  "incomplete": "the HTML is TRUNCATED — it cuts off mid-page. Return the COMPLETE page from <!DOCTYPE html> to </html>.",
+  "no-css": "the page has almost no CSS and renders unstyled. Add a comprehensive <style> block in <head> styling every element.",
+  "unstyled-links": "the page's <a> links render as default blue underlined browser links. Give EVERY link an explicit color, no default underline, with deliberate hover states.",
+  "lorem-ipsum": "the page contains lorem ipsum placeholder text. Replace ALL of it with real, specific copy written for this business.",
+  "empty-img-src": "some <img> tags have empty or missing src attributes. Give every image a real https://picsum.photos/seed/{topic}-{n}/{w}/{h} URL, or remove the tag.",
+};
+
+async function selfCorrect(html, onStatus) {
+  let current = html;
+  for (let pass = 0; pass < MAX_FIX_PASSES; pass++) {
+    const issues = criticReport(current);
+    if (!issues.length) return current;
+    if (onStatus) onStatus("Self-correcting the design...");
+    const fixList = issues.map((i) => "- " + FIX_INSTRUCTIONS[i]).join("\n");
+    const fixPrompt =
+      "You are reviewing your own website output like a senior QA engineer. It has these defects:\n" + fixList +
+      "\n\nFix ONLY the defects listed above. Keep everything else exactly as-is. " +
+      "Return the COMPLETE single HTML document (<!DOCTYPE html> through </html>), raw HTML only, no explanations.\n\nDefective page:\n" +
+      current.slice(0, 60000);
+    try {
+      const fixed = AI_PROVIDER === "gemini"
+        ? await streamGemini(fixPrompt, () => {})
+        : await streamAnthropic(fixPrompt, () => {});
+      const fixedHtml = extractHtml(fixed);
+      if (!isCompleteHtml(fixedHtml)) break;
+      current = fixedHtml;
+    } catch (e) {
+      console.error("Self-correction pass failed:", e.message);
+      break;
+    }
+  }
+  return current;
+}
+
 async function continueGeneration(partialText, onText) {
   const tail = partialText.slice(-6000);
   const contPrompt =
@@ -675,7 +728,28 @@ function rescue(t){
   }
 }
 document.addEventListener("error",function(e){rescue(e.target);},true);
+function healLinks(){
+  // Self-healing links: any <a> still rendering in the browser's default
+  // blue/purple got missed by the page CSS — restyle it to match the page.
+  Array.prototype.forEach.call(document.querySelectorAll("a:not([data-healed])"),function(a){
+    var col=getComputedStyle(a).color.replace(/\s+/g,"");
+    if(col==="rgb(0,0,238)"||col==="rgb(85,26,139)"){
+      a.dataset.healed="1";
+      var p=a.parentElement,found=null;
+      while(p&&p!==document.body){
+        var pc=getComputedStyle(p).color.replace(/\s+/g,"");
+        if(pc&&pc!=="rgb(0,0,0)"&&pc!=="rgb(0,0,238)"&&pc!=="rgb(85,26,139)"){found=pc;break;}
+        p=p.parentElement;
+      }
+      a.style.color=found||"#1a1a1a";
+      a.style.textDecoration="none";
+    }
+  });
+}
+if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",healLinks);
+else healLinks();
 setInterval(function(){
+  healLinks();
   var now=Date.now();
   Array.prototype.forEach.call(document.querySelectorAll("img:not([data-fbk])"),function(t){
     if(t.complete&&t.naturalWidth>0){t.dataset.ok="1";return;}
@@ -1696,44 +1770,10 @@ app.post("/api/generate", async (req, res) => {
       }
       completeHtml = extractHtml(completeText);
     }
-    // Quality gate: if the model skipped the CSS (page would render with
-    // default blue links and no layout), or styled everything except links
-    // (default blue underlined <a> tags slipping through), regenerate once
-    // with an explicit correction. Never ship an unstyled page to the user.
-    const missingCss = !hasSubstantialCss(completeHtml);
-    const unstyledLinks = !missingCss && !hasStyledLinks(completeHtml);
-    if (missingCss || unstyledLinks) {
-      send("status", { message: "Polishing the design..." });
-      try {
-        const fixPrompt =
-          (missingCss
-            ? "Your last website output was missing its CSS styling — it rendered with default browser styles (blue underlined links, no layout). "
-            : "Your last website output styled the page but left its LINKS unstyled — they rendered as default blue underlined browser links, which is a failure. ") +
-          "Regenerate the COMPLETE website from scratch as a single HTML document. This time you MUST include a comprehensive <style> block in the <head> " +
-          "styling every element: CSS reset, EVERY <a> link with an explicit color and no default blue underline (deliberate hover styles only), buttons, nav, hero, cards, sections, footer, responsive rules. " +
-          "A page with default blue underlined links anywhere is a total failure. Output ONLY the raw HTML, no explanations.\n\nOriginal request:\n" + buildPrompt;
-        const retryText =
-          AI_PROVIDER === "gemini"
-            ? await streamGemini(fixPrompt, () => {})
-            : await streamAnthropic(fixPrompt, () => {});
-        let retryComplete = retryText;
-        let retryHtml = extractHtml(retryComplete);
-        for (let i = 0; i < 2 && !isCompleteHtml(retryHtml); i++) {
-          try {
-            retryComplete += await continueGeneration(retryComplete, () => {});
-          } catch (e) {
-            break;
-          }
-          retryHtml = extractHtml(retryComplete);
-        }
-        // Use the retry only if it's actually better (complete + styled + links styled).
-        if (isCompleteHtml(retryHtml) && hasSubstantialCss(retryHtml) && hasStyledLinks(retryHtml)) {
-          completeHtml = retryHtml;
-        }
-      } catch (e) {
-        console.error("Quality retry failed:", e.message);
-      }
-    }
+    // Self-correcting engine: the builder critiques its own page and
+    // surgically repairs defects (up to 3 passes) before it ships.
+    // Never ship a broken page to the user.
+    completeHtml = await selfCorrect(completeHtml, (msg) => send("status", { message: msg }));
     const finalHtml = injectImageGuardian(completeHtml);
     // Keep every successful build as a saved project (draft).
     saveProject(identity.user ? "acct:" + identity.user.id : identity.ledgerKey, prompt, finalHtml);
