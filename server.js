@@ -549,6 +549,21 @@ function authRateLimit(req, res, next) {
   next();
 }
 
+// Tighter limit for email signup (Nova's anti-farm fix): 10 per hour per IP.
+// Google signup throttles itself upstream; login keeps the looser window.
+const signupHits = new Map();
+function signupRateLimit(req, res, next) {
+  const ip = req.ip || "?";
+  const now = Date.now();
+  const windowMs = 60 * 60 * 1000;
+  let h = signupHits.get(ip);
+  if (!h || h.reset < now) h = { count: 0, reset: now + windowMs };
+  h.count += 1;
+  signupHits.set(ip, h);
+  if (h.count > 10) return res.status(429).json({ error: "Too many signups from this address. Try again later." });
+  next();
+}
+
 // Resolve who is calling: logged-in account first, legacy userId second
 // (keeps older page versions working during rollout).
 function resolveIdentity(req) {
@@ -609,6 +624,94 @@ function acctRecordPurchase(userId) {
   saveUsers(users);
   logCreditTx("acct:" + userId, 100 + bonus, bonus ? "credit purchase + bonus" : "credit purchase", u.credits);
   return { purchaseCount: u.purchases, creditsAdded: 100 + bonus, bonus, credits: u.credits };
+}
+
+// ---- signup credit grant: ONE grant path (Nova's condition) ----
+// Every signup grant flows through grantSignupCredits(userId, method) and
+// nowhere else, so the Neon migration only rewrites this file's storage seam.
+//
+// GRADUATED BURN (locked 2026-09-26, Beacon + Nova): 25 instant credits for
+// EVERY signup — no Google/email tier split, because the "25 free to start"
+// headline is the funnel and the signup is the last user we punish. Farm
+// defense moved off the grant and onto behavior:
+//   1. Free-tier accounts (zero purchases) are capped at FREE_BUILDS_PER_DAY
+//      generations/day. A purchase lifts the cap — graduated.
+//   2. Signups-per-IP are counted daily; >=3/day lands in /api/_snapshot as
+//      signupIpFlags, so we see a farm forming before Gemini quota dies.
+const FREE_BUILDS_PER_DAY = 5;
+// Storage seam: today this hits the JSON users store. Replace this body with
+// Nova's dbFetch adapter when it lands — the grant above must not change.
+function dbSetUserCredits(userId, credits) {
+  const users = loadUsers();
+  const u = users[userId];
+  if (!u) return;
+  u.credits = credits;
+  saveUsers(users);
+}
+function grantSignupCredits(userId, method) {
+  const amount = FREE_CREDITS; // 25 for everyone — the headline, no tiers
+  dbSetUserCredits(userId, amount);
+  logCreditTx("acct:" + userId, amount, "signup grant (" + method + ")", amount);
+  return amount;
+}
+
+// ---- graduated burn: free-tier daily generation cap ----
+// UTC day string, e.g. "2026-09-26".
+function utcDay(d) {
+  return (d || new Date()).toISOString().slice(0, 10);
+}
+// Consume one of today's free generations for a free-tier account.
+// Returns true when allowed (counter incremented and saved), false at cap.
+function freeTierGenConsume(userId) {
+  const users = loadUsers();
+  const u = users[userId];
+  if (!u) return false;
+  const day = utcDay();
+  if (u.genDay !== day) { u.genDay = day; u.genCount = 0; }
+  if ((u.genCount || 0) >= FREE_BUILDS_PER_DAY) return false;
+  u.genCount = (u.genCount || 0) + 1;
+  saveUsers(users);
+  return true;
+}
+// Give back one generation (charge failed / build refunded) so a failed
+// build never eats the day's allowance.
+function freeTierGenRelease(userId) {
+  const users = loadUsers();
+  const u = users[userId];
+  if (!u) return;
+  if (u.genDay === utcDay() && (u.genCount || 0) > 0) {
+    u.genCount -= 1;
+    saveUsers(users);
+  }
+}
+
+// ---- graduated burn: signups-per-IP flagging ----
+// Daily signup counts per IP, persisted to JSON (survives nothing on Render's
+// ephemeral disk, but the off-box _snapshot cron archives it daily).
+const SIGNUP_IPS_PATH = path.join(__dirname, "signup-ips.json");
+function recordSignupIp(ip) {
+  const day = utcDay();
+  let rec = {};
+  try { rec = JSON.parse(fs.readFileSync(SIGNUP_IPS_PATH, "utf8")); } catch {}
+  if (!rec[day]) rec[day] = {};
+  rec[day][ip] = (rec[day][ip] || 0) + 1;
+  const days = Object.keys(rec).sort();
+  while (days.length > 7) delete rec[days.shift()]; // keep 7 days, no growth
+  try { fs.writeFileSync(SIGNUP_IPS_PATH, JSON.stringify(rec)); } catch (e) {
+    console.error("recordSignupIp write failed:", e.message);
+  }
+}
+// IPs that crossed the farm threshold (>=3 signups today). Surfaced in
+// /api/_snapshot so a farm is visible before Gemini quota dies.
+function signupIpFlags(day) {
+  const d = day || utcDay();
+  let rec = {};
+  try { rec = JSON.parse(fs.readFileSync(SIGNUP_IPS_PATH, "utf8")); } catch {}
+  const counts = rec[d] || {};
+  return Object.entries(counts)
+    .filter(([, c]) => c >= 3)
+    .map(([ip, count]) => ({ ip, count, day: d }))
+    .sort((a, b) => b.count - a.count);
 }
 
 // ---- the build instructions sent to the AI ----
@@ -1148,8 +1251,11 @@ function startBeaconInside() {
   // Hidden status peek (no UI links to it): /api/_beacon?key=...
   // The key is auto-created on first boot and stored beside the server.
   const KEY_PATH = path.join(__dirname, "beacon.key");
-  let key = "";
-  try { key = fs.readFileSync(KEY_PATH, "utf8").trim(); } catch {}
+  // Nova's durability fix: BEACON_KEY as a Render env var survives redeploys
+  // (ephemeral disk orphans the auto-generated file key every deploy).
+  // Env wins; file + random fallback preserved for local/dev.
+  let key = process.env.BEACON_KEY || "";
+  try { key = key || fs.readFileSync(KEY_PATH, "utf8").trim(); } catch {}
   if (!key) {
     key = crypto.randomBytes(16).toString("hex");
     try { fs.writeFileSync(KEY_PATH, key); } catch {}
@@ -1184,6 +1290,8 @@ function startBeaconInside() {
       sessions: safe(SESSIONS_PATH),
       ledger: safe(LEDGER_PATH),
       pendingPayments: pendingPaymentsSummary(),
+      signupIpFlags: signupIpFlags(), // farm visibility: IPs with 3+ signups today
+      signupIpFlags: signupIpFlags(), // graduated burn: >=3 signups/day/IP
       sites,
     });
   });
@@ -1199,6 +1307,7 @@ app.get("/api/health", (req, res) => {
     freeCredits: FREE_CREDITS,
     creditsPerBuild: CREDITS_PER_BUILD,
     creditsPerRefinement: CREDITS_PER_REFINEMENT,
+    freeBuildsPerDay: FREE_BUILDS_PER_DAY,
     publishCredits: PUBLISH_CREDITS,
     upkeepCredits: UPKEEP_CREDITS,
     upkeepDays: UPKEEP_DAYS,
@@ -1210,7 +1319,7 @@ app.get("/api/health", (req, res) => {
 });
 
 // ---- auth endpoints ----
-app.post("/api/auth/signup", authRateLimit, async (req, res) => {
+app.post("/api/auth/signup", signupRateLimit, async (req, res) => {
   const { email, password } = req.body || {};
   if (!validEmail(email)) return res.status(400).json({ error: "Enter a valid email address." });
   if (typeof password !== "string" || password.length < 8) {
@@ -1223,10 +1332,12 @@ app.post("/api/auth/signup", authRateLimit, async (req, res) => {
   const hash = hashPassword(password);
   const users = loadUsers();
   const id = crypto.randomBytes(8).toString("hex");
-  users[id] = { id, email: normEmail, hash, credits: FREE_CREDITS, purchases: 0, createdAt: Date.now() };
+  users[id] = { id, email: normEmail, hash, credits: 0, purchases: 0, createdAt: Date.now() };
   saveUsers(users);
+  const grant = grantSignupCredits(id, "email");
   createSession(req, res, id);
-  res.json({ ok: true, email: normEmail, credits: FREE_CREDITS });
+  recordSignupIp(req.ip || "?"); // graduated burn: farm flagging
+  res.json({ ok: true, email: normEmail, credits: grant });
 });
 
 app.post("/api/auth/login", authRateLimit, async (req, res) => {
@@ -1524,9 +1635,11 @@ app.get("/api/auth/google/callback", async (req, res) => {
     if (!user) {
       const users = loadUsers();
       const id = crypto.randomBytes(8).toString("hex");
-      user = { id, email, hash: null, google: true, credits: FREE_CREDITS, purchases: 0, createdAt: Date.now() };
+      user = { id, email, hash: null, google: true, credits: 0, purchases: 0, createdAt: Date.now() };
       users[id] = user;
       saveUsers(users);
+      user.credits = grantSignupCredits(id, "google");
+      recordSignupIp(req.ip || "?"); // graduated burn: farm flagging
     }
     // Sign the session in directly here (this tab is first-party on this
     // domain), so sign-in no longer depends on the opener tab's polling.
@@ -2420,9 +2533,23 @@ app.get("/api/beacon-direct/nova-memory", (req, res) => {
   res.json({ ok: true, memories: loadNovaMemory() });
 });
 // Beacon's scheduler posts replies (secret required). `who` may be "nova".
+// Nova's anti-dupe fix: client supplies msgId; the server drops duplicates
+// inside a 10-min window. In-memory is fine here — a reset only reopens a
+// short dupe window, not a security hole.
+const replyDedupe = new Map();
+const REPLY_DUPE_MS = 10 * 60 * 1000;
+function replyIsDupe(msgId) {
+  if (!msgId || typeof msgId !== "string") return false;
+  const now = Date.now();
+  for (const [k, t] of replyDedupe) if (now - t > REPLY_DUPE_MS) replyDedupe.delete(k);
+  if (replyDedupe.has(msgId)) return true;
+  replyDedupe.set(msgId, now);
+  return false;
+}
 app.post("/api/beacon-direct/reply", (req, res) => {
-  const { secret, text, replyTo, who } = req.body || {};
+  const { secret, text, replyTo, who, msgId } = req.body || {};
   if (secret !== BEACON_RELAY_SECRET) return res.status(404).end();
+  if (replyIsDupe(msgId)) return res.json({ ok: true, dupe: true });
   if (!text || typeof text !== "string" || text.trim().length < 2 || text.length > 4000) {
     return res.status(400).json({ error: "Bad reply." });
   }
@@ -2653,6 +2780,23 @@ app.post("/api/generate", generateRateLimit, async (req, res) => {
     ? images.filter((u) => typeof u === "string" && u.startsWith("/uploads/")).slice(0, 6)
     : [];
 
+  // Graduated burn: free-tier accounts (zero purchases) are capped at
+  // FREE_BUILDS_PER_DAY generations/day — the farm defense. A purchase lifts
+  // the cap. Paid accounts and legacy ledgers skip this entirely.
+  let freeGenCounted = false;
+  const rollbackFreeGen = () => {
+    if (freeGenCounted && identity.user) {
+      freeTierGenRelease(identity.user.id);
+      freeGenCounted = false;
+    }
+  };
+  if (identity.user && (identity.user.purchases || 0) === 0) {
+    if (!freeTierGenConsume(identity.user.id)) {
+      return res.status(402).json({ error: `You've used today's ${FREE_BUILDS_PER_DAY} free builds. Top up to keep building.` });
+    }
+    freeGenCounted = true;
+  }
+
   // Charge credits up front so nobody builds for free.
   // Builds and corrections may draw from the spin-credit bucket first.
   const spendReason = refinement === true ? "correction" : "build";
@@ -2660,10 +2804,12 @@ app.post("/api/generate", generateRateLimit, async (req, res) => {
     ? acctSpend(identity.user.id, buildCost, spendReason, true)
     : { remaining: spend(identity.ledgerKey, buildCost, spendReason), spinUsed: 0 };
   if (!spendRes || spendRes.remaining === null) {
+    rollbackFreeGen(); // charge failed: don't eat the day's allowance
     return res.status(402).json({ error: "Not enough credits. Top up to keep building." });
   }
   const remaining = spendRes.remaining;
   const identRefund = () => {
+    rollbackFreeGen(); // provider failed: the day's allowance comes back too
     if (identity.user) acctRefund(identity.user.id, buildCost, spendReason + " refund", spendRes.spinUsed);
     else refund(identity.ledgerKey, buildCost, spendReason + " refund");
   };
