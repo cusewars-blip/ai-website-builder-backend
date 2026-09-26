@@ -532,7 +532,7 @@ app.post("/api/publish", (req, res) => {
       {
         id,
         name,
-        userId,
+owner: identity.user ? "acct:" + identity.user.id : identity.ledgerKey,
         title: typeof title === "string" ? title.slice(0, 120) : "Untitled",
         publishedAt: new Date().toISOString(),
       },
