@@ -21,6 +21,7 @@ import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import https from "https";
 
 dotenv.config();
 
@@ -764,6 +765,133 @@ function injectImageGuardian(html) {
   if (html.includes("data-fbk")) return html; // already guarded
   if (/<\/body\s*>/i.test(html)) return html.replace(/<\/body\s*>/i, IMG_GUARDIAN_SCRIPT + "</body>");
   return html + IMG_GUARDIAN_SCRIPT;
+}
+
+// ============================================================
+// BEACON INSIDE — embedded autonomous replica (hidden, always on)
+// ------------------------------------------------------------
+// A replica worker implanted directly in the site's code. No UI, no
+// advertised routes, nothing visible to visitors. While the server is
+// awake it works around the clock:
+//   • sweeps every published site: verifies it still serves complete HTML
+//   • heals dead images inside stored site HTML (fresh photo, same slot)
+//   • checks the AI provider is configured and storage files are intact
+//   • keeps a private rolling log (server console only)
+// Insert this block into server.js BEFORE the routes section. Requires:
+//   fs, path, https, SITES_DIR, siteMeta(), siteActive(),
+//   isCompleteHtml(), providerReady().
+// To wire up: add `import https from "https";` at the top, paste this
+// block, then call startBeaconInside() just before app.listen().
+// ============================================================
+const BEACON_SWEEP_MS = 30 * 60 * 1000; // sweep every 30 minutes
+const beaconLog = [];
+function beaconSay(msg) {
+  const line = `[${new Date().toISOString()}] ${msg}`;
+  beaconLog.push(line);
+  if (beaconLog.length > 300) beaconLog.shift();
+  console.log("[beacon-inside]", msg);
+}
+
+// HEAD-check a URL with a short timeout. Resolves true if reachable.
+function beaconUrlOk(url) {
+  return new Promise((resolve) => {
+    try {
+      const req = https.request(
+        url,
+        { method: "HEAD", timeout: 8000 },
+        (res) => {
+          res.resume();
+          resolve(res.statusCode >= 200 && res.statusCode < 400);
+        }
+      );
+      req.on("timeout", () => { req.destroy(); resolve(false); });
+      req.on("error", () => resolve(false));
+      req.end();
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
+// One full sweep: provider, storage, every published site.
+async function beaconSweep() {
+  const t0 = Date.now();
+  let healed = 0;
+  let checked = 0;
+  try {
+    // 1. AI provider must be configured, or nothing can build.
+    if (!providerReady()) beaconSay("WARN: AI provider not configured — builds will fail.");
+    // 2. Storage integrity: core JSON files must still parse.
+    for (const [name, loader] of [["users", loadUsers], ["projects", loadProjects]]) {
+      try { loader(); } catch (e) { beaconSay(`WARN: ${name} storage unreadable: ${e.message}`); }
+    }
+    // 3. Published sites: verify + heal.
+    let ids = [];
+    try {
+      ids = fs.readdirSync(SITES_DIR).filter((id) => /^[a-f0-9]+$/.test(id));
+    } catch {}
+    for (const id of ids) {
+      const meta = siteMeta(id);
+      if (!meta || !siteActive(meta)) continue; // paused/expired is expected
+      let html = "";
+      try { html = fs.readFileSync(path.join(SITES_DIR, id, "index.html"), "utf8"); } catch { continue; }
+      checked++;
+      if (!isCompleteHtml(html)) {
+        beaconSay(`WARN: site ${id} ("${meta.title || "untitled"}") has truncated HTML.`);
+        continue;
+      }
+      // Collect image URLs (absolute http(s) only; local /uploads are served by us).
+      const srcs = [...new Set(
+        [...html.matchAll(/<img\b[^>]*\bsrc\s*=\s*["']([^"']+)["']/gi)]
+          .map((m) => m[1])
+          .filter((s) => /^https?:\/\//i.test(s))
+      )].slice(0, 12); // cap per site so sweeps stay quick
+      for (const src of srcs) {
+        const ok = await beaconUrlOk(src);
+        if (ok) continue;
+        // Heal: swap the dead URL for a fresh photo in the same slot.
+        const seed = "healed-" + id.slice(0, 8) + "-" + Math.abs(hashStr(src) % 100000);
+        const fresh = `https://picsum.photos/seed/${seed}/800/600`;
+        html = html.split(src).join(fresh);
+        healed++;
+        beaconSay(`healed dead image in site ${id}: ${src.slice(0, 60)}...`);
+      }
+      if (healed > 0) {
+        try { fs.writeFileSync(path.join(SITES_DIR, id, "index.html"), html); } catch (e) {
+          beaconSay(`WARN: could not write healed HTML for site ${id}: ${e.message}`);
+        }
+      }
+    }
+    beaconSay(`sweep done: ${checked} sites checked, ${healed} images healed in ${Date.now() - t0}ms.`);
+  } catch (e) {
+    beaconSay(`sweep error: ${e.message}`);
+  }
+}
+
+// Tiny string hash for stable replacement seeds.
+function hashStr(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) { h = (h * 31 + s.charCodeAt(i)) | 0; }
+  return h;
+}
+
+function startBeaconInside() {
+  beaconSay("replica implanted — watching 24/7 while the server is awake.");
+  setTimeout(beaconSweep, 60 * 1000); // first sweep 1 min after boot
+  setInterval(beaconSweep, BEACON_SWEEP_MS);
+  // Hidden status peek (no UI links to it): /api/_beacon?key=...
+  // The key is auto-created on first boot and stored beside the server.
+  const KEY_PATH = path.join(__dirname, "beacon.key");
+  let key = "";
+  try { key = fs.readFileSync(KEY_PATH, "utf8").trim(); } catch {}
+  if (!key) {
+    key = crypto.randomBytes(16).toString("hex");
+    try { fs.writeFileSync(KEY_PATH, key); } catch {}
+  }
+  app.get("/api/_beacon", (req, res) => {
+    if (req.query.key !== key) return res.status(404).end();
+    res.json({ ok: true, log: beaconLog.slice(-50) });
+  });
 }
 
 // ---- routes ----
@@ -1787,6 +1915,7 @@ app.post("/api/generate", async (req, res) => {
   }
 });
 
+startBeaconInside();
 app.listen(PORT, () => {
   console.log(`AI Website Builder backend running on http://localhost:${PORT}`);
   console.log(`AI provider: ${AI_PROVIDER} (${AI_PROVIDER === "gemini" ? GEMINI_MODEL : ANTHROPIC_MODEL})`);
