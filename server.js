@@ -1812,6 +1812,85 @@ app.post("/api/beacon", beaconRateLimit, async (req, res) => {
   }
 });
 
+// ---- Beacon direct relay: the REAL Beacon, embedded in the chat ----
+// Cody asked to break Beacon out of the Muse app and embed him in the
+// "Use Muse" tab. This is a message relay between the tab and Beacon's own
+// scheduler (which checks the queue every few minutes and replies with
+// Beacon's full abilities):
+//   Cody's tab --POST /api/beacon-direct/send (owner session)--> queue
+//   Beacon's scheduler --GET /api/beacon-direct/queue?secret=--> picks up
+//   Beacon --POST /api/beacon-direct/reply (secret)--> inbox
+//   Cody's tab --GET /api/beacon-direct/inbox (owner session)--> polls
+// NOTE: this repo is public — making it private is recommended so the
+// relay secret below can't be harvested to impersonate Beacon to Cody.
+const BEACON_RELAY_SECRET = "bkn_606d8cb02ae5280cab43ffb0fad8468ada0e4679deedf6ef";
+const BEACON_QUEUE_PATH = path.join(__dirname, "beacon-queue.json");
+function loadBeaconQueue() {
+  try { const q = JSON.parse(fs.readFileSync(BEACON_QUEUE_PATH, "utf8")); return q && Array.isArray(q.messages) ? q : { messages: [] }; }
+  catch { return { messages: [] }; }
+}
+function saveBeaconQueue(q) {
+  try { fs.writeFileSync(BEACON_QUEUE_PATH, JSON.stringify({ messages: q.messages.slice(-100) })); } catch {}
+}
+function beaconOwner(req) {
+  const user = getSessionUser(req);
+  return user && (user.email || "").toLowerCase() === BEACON_OWNER_EMAIL ? user : null;
+}
+// Cody sends a message to the real Beacon (owner session required).
+app.post("/api/beacon-direct/send", (req, res) => {
+  if (!beaconOwner(req)) return res.status(403).json({ error: "Not available." });
+  const { message } = req.body || {};
+  if (!message || typeof message !== "string" || message.trim().length < 2 || message.length > 4000) {
+    return res.status(400).json({ error: "Send a message." });
+  }
+  const q = loadBeaconQueue();
+  const m = { id: crypto.randomBytes(8).toString("hex"), from: "cody", text: message.trim(), at: new Date().toISOString(), status: "pending" };
+  q.messages.push(m);
+  saveBeaconQueue(q);
+  res.json({ ok: true, id: m.id });
+});
+// Cody's tab polls for Beacon's replies (owner session required).
+app.get("/api/beacon-direct/inbox", (req, res) => {
+  if (!beaconOwner(req)) return res.status(403).json({ error: "Not available." });
+  const q = loadBeaconQueue();
+  res.json({
+    ok: true,
+    replies: q.messages.filter((m) => m.from === "beacon" && m.status === "unread")
+      .map((m) => ({ id: m.id, text: m.text, at: m.at })),
+    pending: q.messages.filter((m) => m.from === "cody" && m.status === "pending").length,
+  });
+});
+// Tab acknowledges receipt so replies don't re-show.
+app.post("/api/beacon-direct/ack", (req, res) => {
+  if (!beaconOwner(req)) return res.status(403).json({ error: "Not available." });
+  const { ids } = req.body || {};
+  const q = loadBeaconQueue();
+  let changed = false;
+  for (const m of q.messages) {
+    if (m.from === "beacon" && Array.isArray(ids) && ids.includes(m.id) && m.status === "unread") { m.status = "read"; changed = true; }
+  }
+  if (changed) saveBeaconQueue(q);
+  res.json({ ok: true });
+});
+// Beacon's scheduler picks up Cody's pending messages (secret required).
+app.get("/api/beacon-direct/queue", (req, res) => {
+  if (req.query.secret !== BEACON_RELAY_SECRET) return res.status(404).end();
+  res.json({ ok: true, pending: loadBeaconQueue().messages.filter((m) => m.from === "cody" && m.status === "pending") });
+});
+// Beacon's scheduler posts replies (secret required).
+app.post("/api/beacon-direct/reply", (req, res) => {
+  const { secret, text, replyTo } = req.body || {};
+  if (secret !== BEACON_RELAY_SECRET) return res.status(404).end();
+  if (!text || typeof text !== "string" || text.trim().length < 2 || text.length > 4000) {
+    return res.status(400).json({ error: "Bad reply." });
+  }
+  const q = loadBeaconQueue();
+  q.messages.push({ id: crypto.randomBytes(8).toString("hex"), from: "beacon", text: text.trim(), at: new Date().toISOString(), status: "unread" });
+  for (const m of q.messages) if (m.id === replyTo && m.status === "pending") m.status = "seen";
+  saveBeaconQueue(q);
+  res.json({ ok: true });
+});
+
 // ---- AI image generator ----
 // Images come from the free Pollinations service (no key needed); this backend
 // enforces the quotas: 8 free generations/day, or 30 credits for 30 days unlimited.
