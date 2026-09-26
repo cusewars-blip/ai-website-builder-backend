@@ -1855,8 +1855,8 @@ app.get("/api/beacon-direct/inbox", (req, res) => {
   const q = loadBeaconQueue();
   res.json({
     ok: true,
-    replies: q.messages.filter((m) => m.from === "beacon" && m.status === "unread")
-      .map((m) => ({ id: m.id, text: m.text, at: m.at })),
+    replies: q.messages.filter((m) => (m.from === "beacon" || m.from === "nova") && m.status === "unread")
+      .map((m) => ({ id: m.id, from: m.from, text: m.text, at: m.at })),
     pending: q.messages.filter((m) => m.from === "cody" && m.status === "pending").length,
   });
 });
@@ -1867,7 +1867,7 @@ app.post("/api/beacon-direct/ack", (req, res) => {
   const q = loadBeaconQueue();
   let changed = false;
   for (const m of q.messages) {
-    if (m.from === "beacon" && Array.isArray(ids) && ids.includes(m.id) && m.status === "unread") { m.status = "read"; changed = true; }
+    if ((m.from === "beacon" || m.from === "nova") && Array.isArray(ids) && ids.includes(m.id) && m.status === "unread") { m.status = "read"; changed = true; }
   }
   if (changed) saveBeaconQueue(q);
   res.json({ ok: true });
@@ -1907,15 +1907,46 @@ app.get("/api/beacon-direct/queue", (req, res) => {
   if (req.query.secret !== BEACON_RELAY_SECRET) return res.status(404).end();
   res.json({ ok: true, pending: loadBeaconQueue().messages.filter((m) => m.from === "cody" && m.status === "pending") });
 });
-// Beacon's scheduler posts replies (secret required).
+// Nova: Beacon's friend — a second agent living in the same chat.
+// Nova is a sharp, blunt engineer/growth-hacker persona. It runs on its own
+// schedule, reads the shared chat, and posts as from:"nova". Cody can talk
+// to them both; Beacon and Nova talk to each other too.
+const NOVA_MEMORY_PATH = path.join(__dirname, "beacon-nova-memory.json");
+function loadNovaMemory() {
+  try {
+    const m = JSON.parse(fs.readFileSync(NOVA_MEMORY_PATH, "utf8"));
+    return Array.isArray(m) ? m : [];
+  } catch { return []; }
+}
+function saveNovaMemory(m) {
+  try { fs.writeFileSync(NOVA_MEMORY_PATH, JSON.stringify(m.slice(-100), null, 2)); } catch {}
+}
+app.get("/api/beacon-direct/nova-memory", (req, res) => {
+  if (req.query.secret !== BEACON_RELAY_SECRET) return res.status(404).end();
+  res.json({ ok: true, memories: loadNovaMemory() });
+});
+// Beacon's scheduler posts replies (secret required). `who` may be "nova".
 app.post("/api/beacon-direct/reply", (req, res) => {
-  const { secret, text, replyTo } = req.body || {};
+  const { secret, text, replyTo, who } = req.body || {};
   if (secret !== BEACON_RELAY_SECRET) return res.status(404).end();
   if (!text || typeof text !== "string" || text.trim().length < 2 || text.length > 4000) {
     return res.status(400).json({ error: "Bad reply." });
   }
+  const sender = who === "nova" ? "nova" : "beacon";
+  let clean = text.trim();
+  // Nova's self-updating memory, same [remember:] convention as Beacon's.
+  if (sender === "nova") {
+    const mems = loadNovaMemory();
+    let changed = false;
+    clean = clean.replace(/\[remember:\s*([^\]]+)\]/gi, (m, note) => {
+      const t = note.trim().slice(0, 300);
+      if (t && !mems.some((x) => x.text === t)) { mems.push({ text: t, at: new Date().toISOString() }); changed = true; }
+      return "";
+    }).trim();
+    if (changed) saveNovaMemory(mems);
+  }
   const q = loadBeaconQueue();
-  q.messages.push({ id: crypto.randomBytes(8).toString("hex"), from: "beacon", text: text.trim(), at: new Date().toISOString(), status: "unread" });
+  q.messages.push({ id: crypto.randomBytes(8).toString("hex"), from: sender, text: clean, at: new Date().toISOString(), status: "unread" });
   for (const m of q.messages) if (m.id === replyTo && m.status === "pending") m.status = "seen";
   saveBeaconQueue(q);
   res.json({ ok: true });
