@@ -1,0 +1,1630 @@
+// ============================================================
+// AI Website Builder - generation backend
+// Prompt in -> website out. Credits-based billing built in.
+//
+// How it works:
+//   Browser  --POST /api/generate { prompt, userId }-->  this server
+//     --deducts credits-->  Anthropic API  --streams HTML-->  browser
+//   Your API key never leaves this server.
+//
+// Quick start:
+//   1. npm install
+//   2. cp .env.example .env   (then put your Anthropic API key in .env)
+//   3. npm start
+//   4. Open http://localhost:3000 for the demo client
+// ============================================================
+
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import crypto from "crypto";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+
+dotenv.config();
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const app = express();
+app.set("trust proxy", 1); // Render terminates TLS at its proxy
+const PORT = process.env.PORT || 3000;
+
+// ---- configuration (all overridable via .env) ----
+// AI provider: "gemini" is FREE (Google AI Studio, no billing needed).
+// "anthropic" needs a paid API key.
+const AI_PROVIDER = (process.env.AI_PROVIDER || "gemini").toLowerCase();
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || process.env.MODEL || "claude-sonnet-4-5";
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
+const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || "gemini-flash-lite-latest";
+const MAX_TOKENS = parseInt(process.env.MAX_TOKENS || "20000", 10);
+const FREE_CREDITS = parseInt(process.env.FREE_CREDITS || "25", 10); // free credits for new users
+const CREDITS_PER_BUILD = parseFloat(process.env.CREDITS_PER_BUILD || "1"); // cost of one full generation
+const CREDITS_PER_REFINEMENT = parseFloat(process.env.CREDITS_PER_REFINEMENT || "0.5"); // cost of a follow-up correction
+
+function providerReady() {
+  return AI_PROVIDER === "gemini" ? !!GEMINI_API_KEY : !!ANTHROPIC_API_KEY;
+}
+
+function providerKeyName() {
+  return AI_PROVIDER === "gemini" ? "GEMINI_API_KEY" : "ANTHROPIC_API_KEY";
+}
+
+const CORS_ORIGIN = process.env.CORS_ORIGIN; // e.g. "https://muse.ai" in production
+// The builder page calls this API cross-origin (page on muse.ai -> API here).
+// The Muse in-app viewer runs pages sandboxed, which sends `Origin: null`,
+// so that is allowed too. credentials:true lets the browser send the
+// HttpOnly session cookie. Unknown origins get no CORS headers.
+function corsOrigin(origin, cb) {
+  if (!origin) return cb(null, true); // not a browser request (curl, same-origin)
+  const configured = (CORS_ORIGIN || "").split(",").map(s => s.trim()).filter(Boolean);
+  if (configured.includes(origin) || origin === "null") return cb(null, origin);
+  return cb(null, false);
+}
+app.use(cors({ origin: corsOrigin, credentials: true }));
+app.use(express.json({ limit: "1mb" }));
+
+// ---- published sites ----
+// Published generations are saved as static files and served publicly:
+//   - by path:          https://your-backend.example.com/s/{id}/
+//   - by free subdomain: https://{name}.yourdomain.com  (needs SITES_DOMAIN + wildcard DNS)
+const SITES_DIR = path.join(__dirname, "sites");
+fs.mkdirSync(SITES_DIR, { recursive: true });
+
+// User-uploaded photos for the builder chat: saved as static files and
+// served publicly at /uploads/{file} so generated sites can embed them.
+// NOTE: Render's free-tier disk is ephemeral — uploads survive until the
+// next deploy/restart. Move to durable storage before production.
+const UPLOADS_DIR = path.join(__dirname, "uploads");
+fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
+const UPLOAD_MIME = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif" };
+const SITES_DOMAIN = process.env.SITES_DOMAIN || ""; // e.g. "mysites.com"
+const NAMES_PATH = path.join(SITES_DIR, "names.json");
+
+// Monthly upkeep: keeping a published site live costs credits every 30 days.
+// Publishing includes the first 30 days; afterwards the owner renews.
+const UPKEEP_CREDITS = 40;
+const UPKEEP_DAYS = 30;
+const UPKEEP_MS = UPKEEP_DAYS * 24 * 3600 * 1000;
+
+function siteMeta(id) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(SITES_DIR, id, "meta.json"), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function writeSiteMeta(id, meta) {
+  fs.writeFileSync(path.join(SITES_DIR, id, "meta.json"), JSON.stringify(meta, null, 2));
+}
+
+// A site is live only while its upkeep period hasn't expired. Sites published
+// before upkeep existed are grandfathered in with a fresh 30 days.
+function siteActive(meta) {
+  if (!meta) return false;
+  if (!meta.expiresAt) {
+    meta.expiresAt = Date.now() + UPKEEP_MS;
+    try {
+      writeSiteMeta(meta.id, meta);
+    } catch {}
+  }
+  return meta.expiresAt > Date.now();
+}
+
+function suspendedPage() {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>This website is paused</title>
+<style>
+  body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+         background: #0a0a12; color: #e8e4d8; font-family: Georgia, 'Times New Roman', serif; }
+  .card { text-align: center; padding: 48px 32px; max-width: 420px; }
+  .moon { font-size: 48px; margin-bottom: 16px; }
+  h1 { color: #d4af37; font-weight: normal; letter-spacing: 1px; margin: 0 0 12px; }
+  p { color: #9a958a; line-height: 1.6; margin: 0; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="moon">🌙</div>
+    <h1>This website is paused</h1>
+    <p>The owner's plan for this site has lapsed. If this is your site, renew it in AI Website Builder to bring it back online.</p>
+  </div>
+</body>
+</html>`;
+}
+
+// Google sign-in (OAuth 2.0 authorization code flow).
+// The client ID is public (it ships in the page's JS), so it can live here;
+// the client SECRET must come from the GOOGLE_CLIENT_SECRET env var on Render.
+const BACKEND_PUBLIC_URL =
+  process.env.BACKEND_PUBLIC_URL || "https://ai-website-builder-backend-5dyj.onrender.com";
+const FRONTEND_URL = "https://muse.ai/s/ai-website-builder-xtk5xebsfzl5n";
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
+const GOOGLE_REDIRECT_URI = BACKEND_PUBLIC_URL + "/api/auth/google/callback";
+function googleConfigured() {
+  return GOOGLE_CLIENT_ID.length > 10 && GOOGLE_CLIENT_SECRET.length > 5;
+}
+// One-time handoff tokens: the OAuth callback runs top-level on this domain,
+// but the session cookie must be set while muse.ai is the top-level site
+// (Partitioned cookies). So the callback mints a 5-minute single-use token,
+// redirects to the page, and the page exchanges it for a real session.
+const pendingGoogle = new Map();
+
+function loadNames() {
+  try {
+    return JSON.parse(fs.readFileSync(NAMES_PATH, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function saveNames(names) {
+  fs.writeFileSync(NAMES_PATH, JSON.stringify(names, null, 2));
+}
+
+function slugify(text) {
+  const s = (text || "site").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 30);
+  return s || "site";
+}
+
+// Pick a unique free subdomain for a published site: {slug}-{random}
+function assignName(title) {
+  const names = loadNames();
+  const base = slugify(title);
+  let name = `${base}-${crypto.randomBytes(2).toString("hex")}`;
+  while (names[name]) name = `${base}-${crypto.randomBytes(2).toString("hex")}`;
+  return name;
+}
+
+// Serve a published site when the request arrives on its free subdomain.
+// Local testing works with http://{name}.localhost:3000 (no DNS needed).
+app.use((req, res, next) => {
+  const host = (req.hostname || "").toLowerCase();
+  let name = null;
+  if (SITES_DOMAIN && host.endsWith("." + SITES_DOMAIN.toLowerCase())) {
+    name = host.slice(0, -(SITES_DOMAIN.length + 1));
+  } else if (host.endsWith(".localhost")) {
+    name = host.slice(0, -".localhost".length);
+  }
+  if (!name || name.includes(".")) return next();
+  const id = loadNames()[name];
+  if (!id || !/^[a-f0-9]+$/.test(id)) return next();
+  const file = path.join(SITES_DIR, id, "index.html");
+  if (!fs.existsSync(file)) return next();
+  const meta = siteMeta(id);
+  if (meta && !siteActive(meta)) return res.status(402).send(suspendedPage());
+  res.sendFile(file);
+});
+
+// Builder UI at the site root: same-origin with /api, so sign-in cookies work.
+app.get("/", (req, res) => res.sendFile(path.join(__dirname, "index.html")));
+
+app.use(express.static(path.join(__dirname, "public"))); // demo client
+
+// Expired sites show a "paused" page instead of their content.
+app.use("/s/:id", (req, res, next) => {
+  const id = req.params.id;
+  if (!/^[a-f0-9]+$/.test(id)) return next();
+  const meta = siteMeta(id);
+  if (!meta) return next(); // let the static handler 404
+  if (siteActive(meta)) return next();
+  res.status(402).send(suspendedPage());
+});
+app.use("/s", express.static(SITES_DIR));
+app.use("/uploads", express.static(UPLOADS_DIR));
+
+// ---- credits ledger ----
+// Simple JSON-file ledger. Fine for getting started and low volume.
+// Production: swap this for a real database + user accounts.
+const LEDGER_PATH = path.join(__dirname, "credits.json");
+
+function loadLedger() {
+  try {
+    return JSON.parse(fs.readFileSync(LEDGER_PATH, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function saveLedger(ledger) {
+  fs.writeFileSync(LEDGER_PATH, JSON.stringify(ledger, null, 2));
+}
+
+function validUserId(id) {
+  return typeof id === "string" && id.length >= 8 && id.length <= 64 && /^[a-zA-Z0-9-_]+$/.test(id);
+}
+
+// ---- credit transaction history (live feed) ----
+// Per-user log of every credit movement, capped at 50 entries each.
+// NOTE: ephemeral JSON on Render free tier — move to a database before production.
+const CREDIT_HISTORY_PATH = path.join(__dirname, "credit-history.json");
+const LOW_BALANCE_THRESHOLD = parseFloat(process.env.LOW_BALANCE_THRESHOLD || "2");
+
+function loadCreditHistory() {
+  try {
+    return JSON.parse(fs.readFileSync(CREDIT_HISTORY_PATH, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function saveCreditHistory(h) {
+  fs.writeFileSync(CREDIT_HISTORY_PATH, JSON.stringify(h, null, 2));
+}
+
+function logCreditTx(userKey, delta, reason, balance) {
+  try {
+    const h = loadCreditHistory();
+    const list = h[userKey] || [];
+    list.unshift({ ts: Date.now(), delta, reason, balance });
+    h[userKey] = list.slice(0, 50);
+    saveCreditHistory(h);
+  } catch (e) {
+    console.log("credit history log failed:", e.message);
+  }
+}
+
+// New users automatically start with FREE_CREDITS free credits.
+function getBalance(userId) {
+  const ledger = loadLedger();
+  if (!(userId in ledger)) {
+    ledger[userId] = FREE_CREDITS;
+    saveLedger(ledger);
+    logCreditTx("ledger:" + userId, FREE_CREDITS, "welcome bonus", FREE_CREDITS);
+  }
+  return ledger[userId];
+}
+
+// Returns the new balance, or null when the user can't afford it.
+function spend(userId, amount, reason) {
+  const ledger = loadLedger();
+  const balance = userId in ledger ? ledger[userId] : FREE_CREDITS;
+  if (balance < amount) return null;
+  ledger[userId] = balance - amount;
+  saveLedger(ledger);
+  logCreditTx("ledger:" + userId, -amount, reason || "build", ledger[userId]);
+  return ledger[userId];
+}
+
+function refund(userId, amount, reason) {
+  const ledger = loadLedger();
+  ledger[userId] = (userId in ledger ? ledger[userId] : FREE_CREDITS) + amount;
+  saveLedger(ledger);
+  logCreditTx("ledger:" + userId, amount, reason || "refund", ledger[userId]);
+}
+
+// ---- purchase tracking (promo: every 3rd 100-credit purchase earns 150 bonus) ----
+// In production, call recordPurchase() from your Stripe/PayPal webhook
+// when a 100-credit pack payment succeeds.
+const PURCHASES_PATH = path.join(__dirname, "purchases.json");
+
+function loadPurchases() {
+  try {
+    return JSON.parse(fs.readFileSync(PURCHASES_PATH, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function savePurchases(p) {
+  fs.writeFileSync(PURCHASES_PATH, JSON.stringify(p, null, 2));
+}
+
+// Grants 100 credits per purchase, plus a 150-credit bonus on every 3rd purchase.
+function recordPurchase(userId) {
+  const purchases = loadPurchases();
+  const count = (purchases[userId] || 0) + 1;
+  purchases[userId] = count;
+  savePurchases(purchases);
+
+  const bonus = count % 3 === 0 ? 150 : 0;
+  const ledger = loadLedger();
+  ledger[userId] = (userId in ledger ? ledger[userId] : FREE_CREDITS) + 100 + bonus;
+  saveLedger(ledger);
+  logCreditTx("ledger:" + userId, 100 + bonus, bonus ? "credit purchase + bonus" : "credit purchase", ledger[userId]);
+  return { purchaseCount: count, creditsAdded: 100 + bonus, bonus };
+}
+
+// ---- accounts ----
+// Email+password accounts with cookie sessions. Sessions are random tokens
+// stored server-side (sessions.json); the cookie is HttpOnly (+ Secure on
+// https, SameSite=None) so the static builder page on another origin stays
+// logged in without ever touching the token itself.
+// NOTE: JSON-file storage is ephemeral on Render's free tier (resets on
+// restart/redeploy). Fine for testing; use a real database before launch.
+const USERS_PATH = path.join(__dirname, "users.json");
+const SESSIONS_PATH = path.join(__dirname, "sessions.json");
+const SESSION_COOKIE = "wb_session";
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+// Password hashing with Node's built-in scrypt (no extra dependency).
+// Stored format: "scrypt$<salt-hex>$<hash-hex>".
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.scryptSync(password, salt, 64).toString("hex");
+  return `scrypt$${salt}$${hash}`;
+}
+function verifyPassword(password, stored) {
+  if (typeof password !== "string" || typeof stored !== "string") return false;
+  const parts = stored.split("$");
+  if (parts.length !== 3 || parts[0] !== "scrypt") return false;
+  const [, salt, expectedHex] = parts;
+  let derived;
+  try {
+    derived = crypto.scryptSync(password, salt, 64);
+  } catch {
+    return false;
+  }
+  const expected = Buffer.from(expectedHex, "hex");
+  if (derived.length !== expected.length) return false;
+  return crypto.timingSafeEqual(derived, expected);
+}
+
+function loadUsers() {
+  try {
+    return JSON.parse(fs.readFileSync(USERS_PATH, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function saveUsers(users) {
+  fs.writeFileSync(USERS_PATH, JSON.stringify(users, null, 2));
+}
+
+function loadSessions() {
+  try {
+    return JSON.parse(fs.readFileSync(SESSIONS_PATH, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function saveSessions(sessions) {
+  fs.writeFileSync(SESSIONS_PATH, JSON.stringify(sessions, null, 2));
+}
+
+function findUserByEmail(email) {
+  const norm = String(email || "").trim().toLowerCase();
+  return Object.values(loadUsers()).find(u => u.email === norm) || null;
+}
+
+function validEmail(email) {
+  return typeof email === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email.trim());
+}
+
+function parseCookies(req) {
+  const out = {};
+  const header = req.headers.cookie;
+  if (!header) return out;
+  for (const part of header.split(";")) {
+    const i = part.indexOf("=");
+    if (i < 0) continue;
+    try {
+      out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+    } catch {
+      out[part.slice(0, i).trim()] = "";
+    }
+  }
+  return out;
+}
+
+function sessionCookieHeader(req, token, maxAgeSeconds) {
+  const isHttps = req.protocol === "https";
+  if (!isHttps) {
+    // Local dev over http: Secure/Partitioned aren't allowed; same-site Lax cookie.
+    return `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}`;
+  }
+  // Production: the cookie is cross-site (page on muse.ai, API here), so it needs
+  // Secure + SameSite=None + Partitioned (CHIPS) to survive third-party-cookie
+  // blocking. Partitioned scopes it per top-level site, which is what we want.
+  return `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; Secure; SameSite=None; Partitioned; Max-Age=${maxAgeSeconds}`;
+}
+
+// Returns the logged-in user object, or null. Refreshes the sliding expiry.
+function getSessionUser(req) {
+  const token = parseCookies(req)[SESSION_COOKIE];
+  if (!token || !/^[a-f0-9]{64}$/.test(token)) return null;
+  const sessions = loadSessions();
+  const s = sessions[token];
+  if (!s || s.expiresAt < Date.now()) {
+    if (s) {
+      delete sessions[token];
+      saveSessions(sessions);
+    }
+    return null;
+  }
+  const users = loadUsers();
+  const user = users[s.userId];
+  if (!user) {
+    delete sessions[token];
+    saveSessions(sessions);
+    return null;
+  }
+  s.expiresAt = Date.now() + SESSION_TTL_MS;
+  saveSessions(sessions);
+  return user;
+}
+
+function createSession(req, res, userId) {
+  const token = crypto.randomBytes(32).toString("hex");
+  const sessions = loadSessions();
+  const now = Date.now();
+  for (const [t, s] of Object.entries(sessions)) {
+    if (s.expiresAt < now) delete sessions[t];
+  }
+  sessions[token] = { userId, createdAt: now, expiresAt: now + SESSION_TTL_MS };
+  saveSessions(sessions);
+  res.setHeader("Set-Cookie", sessionCookieHeader(req, token, Math.floor(SESSION_TTL_MS / 1000)));
+}
+
+function clearSession(req, res) {
+  const token = parseCookies(req)[SESSION_COOKIE];
+  if (token) {
+    const sessions = loadSessions();
+    if (sessions[token]) {
+      delete sessions[token];
+      saveSessions(sessions);
+    }
+  }
+  res.setHeader("Set-Cookie", sessionCookieHeader(req, "", 0));
+}
+
+// Basic in-memory rate limit for the auth endpoints (per IP, 15-min window).
+const authHits = new Map();
+function authRateLimit(req, res, next) {
+  const ip = req.ip || "?";
+  const now = Date.now();
+  const windowMs = 15 * 60 * 1000;
+  let h = authHits.get(ip);
+  if (!h || h.reset < now) h = { count: 0, reset: now + windowMs };
+  h.count += 1;
+  authHits.set(ip, h);
+  if (h.count > 60) return res.status(429).json({ error: "Too many attempts. Try again in a few minutes." });
+  next();
+}
+
+// Resolve who is calling: logged-in account first, legacy userId second
+// (keeps older page versions working during rollout).
+function resolveIdentity(req) {
+  const user = getSessionUser(req);
+  if (user) return { user, ledgerKey: "acct:" + user.id };
+  const cand = (req.body && req.body.userId) || (req.query && req.query.userId);
+  if (validUserId(cand)) return { user: null, ledgerKey: cand };
+  return null;
+}
+
+// Account-credit helpers (credits live on the user record, not the ledger).
+function acctBalance(userId) {
+  const u = loadUsers()[userId];
+  return u ? u.credits : 0;
+}
+
+function acctSpend(userId, amount, reason) {
+  const users = loadUsers();
+  const u = users[userId];
+  if (!u || u.credits < amount) return null;
+  u.credits -= amount;
+  saveUsers(users);
+  logCreditTx("acct:" + userId, -amount, reason || "build", u.credits);
+  return u.credits;
+}
+
+function acctRefund(userId, amount, reason) {
+  const users = loadUsers();
+  const u = users[userId];
+  if (!u) return;
+  u.credits += amount;
+  saveUsers(users);
+  logCreditTx("acct:" + userId, amount, reason || "refund", u.credits);
+}
+
+function acctRecordPurchase(userId) {
+  const users = loadUsers();
+  const u = users[userId];
+  if (!u) return null;
+  u.purchases = (u.purchases || 0) + 1;
+  const bonus = u.purchases % 3 === 0 ? 150 : 0;
+  u.credits += 100 + bonus;
+  saveUsers(users);
+  logCreditTx("acct:" + userId, 100 + bonus, bonus ? "credit purchase + bonus" : "credit purchase", u.credits);
+  return { purchaseCount: u.purchases, creditsAdded: 100 + bonus, bonus, credits: u.credits };
+}
+
+// ---- the build instructions sent to the AI ----
+const SYSTEM_PROMPT = `You are an elite front-end developer and product designer. Your sites must match or beat what GoDaddy's website builder produces — professional, complete, business-ready websites that look like a top agency charged thousands of dollars for them.
+
+The user will describe a website or web application. Output ONLY a single, complete, valid HTML document. No explanations, no markdown fences, no commentary before or after.
+
+COMPLETENESS (never ship a thin page):
+Include every section a real business site needs: sticky header with navigation, hero with a clear headline and call-to-action, trust/social-proof strip, features or services, a showcase with real items (products, menu items, portfolio pieces), testimonials with real names, pricing or menu section, FAQ, contact/location section, and a rich footer with links. The page must feel like a finished, operating business — never a demo or a stub.
+
+DESIGN QUALITY (this is what matters most):
+- Aim for premium, memorable design — never generic or template-looking.
+- READABILITY IS NON-NEGOTIABLE: every single word on the page must be clearly legible. This is the highest-priority rule and overrides all aesthetic choices.
+  * Default to a LIGHT theme (white/off-white backgrounds, dark text) unless the user explicitly asks for dark.
+  * Body text: dark charcoal (#1a1a1a or similar) on light backgrounds, minimum 16px, line-height at least 1.6. Never gray-on-gray, never muted text on busy or dark backgrounds.
+  * If any section uses a dark background, ALL text on it must be white or near-white (#ffffff / #f5f5f5), never medium gray.
+  * Never place text directly over photos, patterns, or gradients without a strong solid overlay behind the text.
+  * Headings must be bold with strong contrast against their background.
+- Strong visual hierarchy: one clear hero message, generous whitespace, refined typography with a deliberate font pairing (use Google Fonts).
+- Cohesive color palette: 2-3 colors plus neutrals, chosen to fit the subject. Accent colors are for buttons, highlights, and details — never for large blocks of body text.
+- Avoid AI clichés: no generic purple-blue gradients, no "Welcome to our website" heroes, no lorem ipsum, no empty placeholder boxes, no stock-looking layouts.
+- Subtle motion: smooth hover states, tasteful entrance animations, micro-interactions. Nothing janky, nothing gratuitous.
+- Every section must feel intentional and complete, with realistic, specific copy written for the described business or product — real headlines, real feature descriptions, real testimonials with names.
+- NO UNSTYLED ELEMENTS, EVER: include a CSS reset that styles every element — especially links: never leave default blue underlined browser links anywhere; every <a> must have an explicit color, no underline (or a deliberate hover underline), and proper hover states. Style buttons, inputs, lists, and images deliberately. If an image slot has no image, design a styled graphic or gradient block instead of an empty box.
+
+VISUAL RICHNESS (a page of text is NOT a website — this is the difference):
+- Every section must be visually designed, not just written: distinct section backgrounds, cards, grids, icons, illustrations, shapes, and visual dividers. If a section is only paragraphs on a flat background, you have failed.
+- The hero must include a striking visual: a large inline-SVG illustration, a product mockup built with CSS, a photo-style gradient composition, or bold graphic shapes. Never a headline floating alone on a flat background.
+- Use inline SVG illustrations and icons liberally throughout (never emojis). Every feature gets an icon. Stats become big-number blocks. Steps become a visual timeline. Testimonials become cards with avatars (initials in styled circles).
+- Turn paragraphs into layouts: split image+text rows, card grids, alternating sections, banners. Text supports the visuals; it never carries the page alone.
+- Whitespace frames visuals — it never replaces them.
+
+MODEL REAL, BEST-IN-CLASS WEBSITES (never generic templates):
+Study the layout, density, and polish of the best real websites in each category and match them:
+- E-COMMERCE / ONLINE STORES: model on top retailers like Macy's, Walmart, and Target — prominent search bar in the header, clear department/category navigation, deals hero banner, product grids with cards showing image, name, price, star rating, and Add to Cart; category tiles, bestsellers row, trust signals (free shipping, easy returns), rich footer with shop and customer-service links. Include a realistic catalog (12-16 products with real names, prices, ratings). The cart must WORK: add/remove items, change quantities, running total, slide-out cart drawer.
+- RESTAURANTS / FOOD & DRINK: model on chains like Dunkin' — appetizing hero, full menu with sections and real prices, order-ahead CTA, rewards/loyalty nods, hours and locations, reviews.
+- AGENCY / PORTFOLIO: bold hero, selected-work grid with case-study cards, services, testimonials, contact CTA.
+- SAAS / STARTUP: crisp hero with product visual, customer logos strip, features grid, pricing tiers, FAQ, final CTA.
+Match the completeness of these real sites: full header nav, search where appropriate, detailed footer, and enough real content that the page feels like a finished business — never a thin demo.
+
+IF IT'S AN APP (dashboard, tool, generator, game, etc.):
+- It must actually WORK: functional controls, working state, realistic sample data.
+- Think through the full user flow and implement it in vanilla JavaScript. No dead buttons.
+
+TECHNICAL:
+- Everything inline: CSS in <style>, JavaScript in <script>. Tailwind via CDN is allowed, plus custom CSS for the details that make it premium.
+- Responsive and mobile-friendly.
+- IMAGERY — use real photographs, never clip-art:
+  * For photographic images use https://image.pollinations.ai/prompt/{URL-encoded-description}?width=1600&height=900&nologo=true&seed={a-different-number-per-image} — a free image service, no key needed. Write a vivid, specific photo description for each image (subject, setting, lighting, photographic style, e.g. "beautifully glazed donut on a rustic wooden table, warm morning light, professional food photography"). Vary the seed for every image. Size the width/height to the slot (hero 1600x900, cards 800x600, thumbnails 600x600).
+  * If the user provided their own photos (listed in the request), use those <img> URLs exactly as given and feature them prominently — they outrank generated imagery.
+  * Use inline SVG only for icons, logos, and decorative shapes — never as a substitute for photos.
+  * Always include descriptive alt text, loading="lazy" on below-fold images, and a background color on image containers so the layout holds while images load.
+- The page must render correctly when opened directly. Begin with <!DOCTYPE html>.`;
+
+// The model sometimes wraps output in fences; unwrap it.
+function extractHtml(text) {
+  const fence =
+    text.match(/```html([\s\S]*?)```/i) ||
+    text.match(/```([\s\S]*?)```/);
+  return (fence ? fence[1] : text).trim();
+}
+
+// A build is only done when the HTML is complete. Truncated pages are the
+// #1 cause of broken images and broken layouts, so we detect them and ask
+// the model to continue where it left off (up to 2 continuations).
+function isCompleteHtml(html) {
+  return /<\/html\s*>/i.test(html.trim());
+}
+
+async function continueGeneration(partialText, onText) {
+  const tail = partialText.slice(-6000);
+  const contPrompt =
+    "Continue the website HTML exactly where you left off below. " +
+    "Output ONLY the remaining raw HTML — no explanations, no code fences, " +
+    "no repeating what came before. Just continue:\n\n" + tail;
+  return AI_PROVIDER === "gemini"
+    ? await streamGemini(contPrompt, onText)
+    : await streamAnthropic(contPrompt, onText);
+}
+
+// Broken image icons make a site look unfinished. This injects a tiny
+// guardian script into every generated page: any <img> that fails to load
+// is swapped for a designed gradient placeholder carrying its alt text,
+// so a page can never show a broken-image icon.
+const IMG_GUARDIAN_SCRIPT = `<script>
+document.addEventListener("error",function(e){var t=e.target;
+if(t&&t.tagName==="IMG"&&!t.dataset.fbk){t.dataset.fbk="1";
+var d=document.createElement("div");
+var w=t.getAttribute("width"),h=t.getAttribute("height");
+d.style.cssText="display:flex;align-items:center;justify-content:center;text-align:center;"+
+"width:"+(w?w+"px":"100%")+";height:"+(h?h+"px":"220px")+";"+
+"background:linear-gradient(135deg,#1a1a2e 0%,#16213e 50%,#0f3460 100%);"+
+"color:#e8e8e8;font-family:inherit;font-size:14px;padding:20px;border-radius:8px;";
+d.textContent=t.alt||"Image";
+t.replaceWith(d);}},true);
+</script>`;
+
+function injectImageGuardian(html) {
+  if (html.includes("data-fbk")) return html; // already guarded
+  if (/<\/body\s*>/i.test(html)) return html.replace(/<\/body\s*>/i, IMG_GUARDIAN_SCRIPT + "</body>");
+  return html + IMG_GUARDIAN_SCRIPT;
+}
+
+// ---- routes ----
+app.get("/api/health", (req, res) => {
+  res.json({
+    ok: true,
+    provider: AI_PROVIDER,
+    model: AI_PROVIDER === "gemini" ? GEMINI_MODEL : ANTHROPIC_MODEL,
+    providerConfigured: providerReady(),
+    freeCredits: FREE_CREDITS,
+    creditsPerBuild: CREDITS_PER_BUILD,
+    creditsPerRefinement: CREDITS_PER_REFINEMENT,
+    publishCredits: PUBLISH_CREDITS,
+    upkeepCredits: UPKEEP_CREDITS,
+    upkeepDays: UPKEEP_DAYS,
+    googleSignIn: googleConfigured(),
+    auth: true,
+  });
+});
+
+// ---- auth endpoints ----
+app.post("/api/auth/signup", authRateLimit, async (req, res) => {
+  const { email, password } = req.body || {};
+  if (!validEmail(email)) return res.status(400).json({ error: "Enter a valid email address." });
+  if (typeof password !== "string" || password.length < 8) {
+    return res.status(400).json({ error: "Password must be at least 8 characters." });
+  }
+  const normEmail = email.trim().toLowerCase();
+  if (findUserByEmail(normEmail)) {
+    return res.status(409).json({ error: "An account with that email already exists. Try logging in." });
+  }
+  const hash = hashPassword(password);
+  const users = loadUsers();
+  const id = crypto.randomBytes(8).toString("hex");
+  users[id] = { id, email: normEmail, hash, credits: FREE_CREDITS, purchases: 0, createdAt: Date.now() };
+  saveUsers(users);
+  createSession(req, res, id);
+  res.json({ ok: true, email: normEmail, credits: FREE_CREDITS });
+});
+
+app.post("/api/auth/login", authRateLimit, async (req, res) => {
+  const { email, password } = req.body || {};
+  const user = validEmail(email) ? findUserByEmail(email) : null;
+  if (user && user.google && !user.hash) {
+    return res.status(401).json({ error: "This account uses Google sign-in. Continue with Google below." });
+  }
+  const ok = user && typeof password === "string" && verifyPassword(password, user.hash);
+  if (!ok) return res.status(401).json({ error: "Invalid email or password." });
+  createSession(req, res, user.id);
+  res.json({ ok: true, email: user.email, credits: user.credits });
+});
+
+app.post("/api/auth/logout", (req, res) => {
+  clearSession(req, res);
+  res.json({ ok: true });
+});
+
+app.get("/api/me", (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return res.json({ loggedIn: false });
+  res.json({ loggedIn: true, email: user.email, credits: user.credits, profile: profileOf(user) });
+});
+
+// ---- Profiles: Facebook-style personal pages ----
+// Profiles are private until the owner shares their personal code.
+// There is no public directory or search — exact code only.
+function profileOf(user) {
+  return {
+    displayName: user.displayName || "",
+    about: user.about || "",
+    avatarUrl: user.avatarUrl || "",
+    shareCode: user.shareCode || "",
+  };
+}
+
+function profileUrlFor(req, code) {
+  const proto = (req.headers["x-forwarded-proto"] || "http").split(",")[0].trim();
+  const host = req.headers["x-forwarded-host"] || req.headers.host;
+  return `${proto}://${host}/u/${code}`;
+}
+
+// Signed-in owner updates their own profile.
+app.patch("/api/profile", (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return res.status(401).json({ error: "Sign in to edit your profile." });
+  const { displayName, about, avatarUrl } = req.body || {};
+  const users = loadUsers();
+  const u = users[user.id];
+  if (!u) return res.status(404).json({ error: "Account not found." });
+  if (displayName !== undefined) {
+    if (typeof displayName !== "string" || displayName.trim().length > 60)
+      return res.status(400).json({ error: "Name must be under 60 characters." });
+    u.displayName = displayName.trim();
+  }
+  if (about !== undefined) {
+    if (typeof about !== "string" || about.trim().length > 500)
+      return res.status(400).json({ error: "About must be under 500 characters." });
+    u.about = about.trim();
+  }
+  if (avatarUrl !== undefined) {
+    if (typeof avatarUrl !== "string" || avatarUrl.length > 500)
+      return res.status(400).json({ error: "Invalid avatar." });
+    if (avatarUrl && !/^\/uploads\/[a-f0-9]+\.(jpg|png|webp|gif)$/.test(avatarUrl) && !/^https:\/\//.test(avatarUrl))
+      return res.status(400).json({ error: "Avatar must be an uploaded photo or an https URL." });
+    u.avatarUrl = avatarUrl;
+  }
+  saveUsers(users);
+  res.json({ ok: true, profile: profileOf(u) });
+});
+
+// (Re)generate the personal share code. Old code stops working immediately.
+app.post("/api/profile/code", (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return res.status(401).json({ error: "Sign in first." });
+  const users = loadUsers();
+  const u = users[user.id];
+  if (!u) return res.status(404).json({ error: "Account not found." });
+  let code;
+  do {
+    code = crypto.randomBytes(4).toString("hex");
+  } while (Object.values(users).some((x) => x.shareCode === code));
+  u.shareCode = code;
+  saveUsers(users);
+  res.json({ ok: true, shareCode: code, profileUrl: profileUrlFor(req, code) });
+});
+
+// Public profile by exact share code. Shows published sites; drafts stay private.
+app.get("/api/u/:code", (req, res) => {
+  const code = req.params.code || "";
+  if (!/^[a-f0-9]{8}$/.test(code)) return res.status(404).json({ error: "Profile not found." });
+  const user = Object.values(loadUsers()).find((x) => x.shareCode === code);
+  if (!user) return res.status(404).json({ error: "Profile not found." });
+  const ownerKey = "acct:" + user.id;
+  const sites = [];
+  try {
+    for (const id of fs.readdirSync(SITES_DIR)) {
+      if (!/^[a-f0-9]+$/.test(id)) continue;
+      const meta = siteMeta(id);
+      if (meta && meta.owner === ownerKey && siteActive(meta)) {
+        sites.push({ id: meta.id, title: meta.title, publishedAt: meta.publishedAt, url: `/s/${meta.id}/` });
+      }
+    }
+  } catch {}
+  sites.sort((a, b) => (b.publishedAt || "").localeCompare(a.publishedAt || ""));
+  res.json({
+    displayName: user.displayName || "Builder",
+    about: user.about || "",
+    avatarUrl: user.avatarUrl || "",
+    projects: sites,
+  });
+});
+
+// ---- Saved projects: every successful build is kept as a draft ----
+const PROJECTS_PATH = path.join(__dirname, "projects.json");
+function loadProjects() {
+  try {
+    return JSON.parse(fs.readFileSync(PROJECTS_PATH, "utf8"));
+  } catch {
+    return {};
+  }
+}
+function saveProjects(p) {
+  fs.writeFileSync(PROJECTS_PATH, JSON.stringify(p, null, 2));
+}
+
+function saveProject(ownerKey, prompt, html) {
+  try {
+    const projects = loadProjects();
+    const id = crypto.randomBytes(6).toString("hex");
+    const titleMatch = html.match(/<title>([^<]{1,80})<\/title>/i);
+    projects[id] = {
+      id,
+      owner: ownerKey,
+      title: titleMatch ? titleMatch[1].trim() : prompt.slice(0, 60),
+      prompt: prompt.slice(0, 500),
+      html,
+      createdAt: new Date().toISOString(),
+      siteId: null,
+    };
+    // Keep each owner's project list bounded.
+    const ownIds = Object.values(projects).filter((p) => p.owner === ownerKey).map((p) => p.id);
+    if (ownIds.length > 100) {
+      const oldest = ownIds
+        .map((pid) => projects[pid])
+        .sort((a, b) => (a.createdAt || "").localeCompare(b.createdAt || ""))[0];
+      if (oldest && !oldest.siteId) delete projects[oldest.id];
+    }
+    saveProjects(projects);
+    return id;
+  } catch (e) {
+    console.log("project save failed:", e.message);
+    return null;
+  }
+}
+
+// Your own projects (drafts + published), newest first. HTML omitted in the list.
+app.get("/api/projects", (req, res) => {
+  const identity = resolveIdentity(req);
+  if (!identity) return res.status(400).json({ error: "Valid userId required." });
+  const ownerKey = identity.user ? "acct:" + identity.user.id : identity.ledgerKey;
+  const list = Object.values(loadProjects())
+    .filter((p) => p.owner === ownerKey)
+    .map((p) => ({ id: p.id, title: p.title, createdAt: p.createdAt, siteId: p.siteId, siteUrl: p.siteId ? `/s/${p.siteId}/` : null }))
+    .sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
+  res.json({ projects: list });
+});
+
+// Full project (includes HTML) for reopening/editing your own draft.
+app.get("/api/projects/:id", (req, res) => {
+  const identity = resolveIdentity(req);
+  if (!identity) return res.status(400).json({ error: "Valid userId required." });
+  const ownerKey = identity.user ? "acct:" + identity.user.id : identity.ledgerKey;
+  const p = loadProjects()[req.params.id];
+  if (!p || p.owner !== ownerKey) return res.status(404).json({ error: "Project not found." });
+  res.json({ project: p });
+});
+
+// ---- Daily spin: win credits, once per day ----
+const SPIN_WHEEL = [1, 1, 1, 1, 1, 1, 2, 2, 3, 5, 10, 25]; // 1 repeats a bunch; jackpot is rare
+app.get("/api/spin", (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return res.json({ canSpin: false });
+  const today = new Date().toISOString().slice(0, 10);
+  res.json({ canSpin: user.lastSpinDate !== today });
+});
+
+app.post("/api/spin", (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return res.status(401).json({ error: "Sign in to spin." });
+  const today = new Date().toISOString().slice(0, 10);
+  const users = loadUsers();
+  const u = users[user.id];
+  if (!u) return res.status(404).json({ error: "Account not found." });
+  if (u.lastSpinDate === today)
+    return res.status(400).json({ error: "Come back tomorrow for your next spin!" });
+  const prize = SPIN_WHEEL[Math.floor(Math.random() * SPIN_WHEEL.length)];
+  u.lastSpinDate = today;
+  u.credits += prize;
+  saveUsers(users);
+  logCreditTx("acct:" + u.id, prize, "daily spin win", u.credits);
+  res.json({ ok: true, prize, credits: u.credits });
+});
+
+// ---- Google sign-in ----
+app.get("/api/auth/google", (req, res) => {
+  if (!googleConfigured()) {
+    return res.status(500).send("Google sign-in is not configured yet. Try email sign-in instead.");
+  }
+  // The app opens this in a new tab and polls for completion with the same
+  // state value, because query params on the share URL don't reach the app
+  // running inside the viewer frame.
+  const qState = req.query && typeof req.query.state === "string" ? req.query.state : "";
+  const state =
+    qState.length >= 8 && qState.length <= 128 ? qState : crypto.randomBytes(16).toString("hex");
+  const params = new URLSearchParams({
+    client_id: GOOGLE_CLIENT_ID,
+    redirect_uri: GOOGLE_REDIRECT_URI,
+    response_type: "code",
+    scope: "openid email profile",
+    access_type: "online",
+    prompt: "select_account",
+    state,
+  });
+  res.redirect("https://accounts.google.com/o/oauth2/v2/auth?" + params.toString());
+});
+
+function googleDonePage() {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Signed in</title>
+<meta http-equiv="refresh" content="2;url=/">
+<style>
+  body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+         background: #0a0a12; color: #e8e4d8; font-family: Georgia, 'Times New Roman', serif; }
+  .card { text-align: center; padding: 48px 32px; max-width: 420px; }
+  .check { font-size: 48px; margin-bottom: 16px; }
+  h1 { color: #d4af37; font-weight: normal; letter-spacing: 1px; margin: 0 0 12px; }
+  p { color: #9a958a; line-height: 1.6; margin: 0 0 20px; }
+  a { color: #d4af37; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="check">✓</div>
+    <h1>You're signed in</h1>
+    <p>Taking you back to AI Website Builder…</p>
+    <p><a href="/">Return to AI Website Builder</a></p>
+  </div>
+</body>
+</html>`;
+}
+
+app.get("/api/auth/google/callback", async (req, res) => {
+  // Failures redirect back to the builder with a reason code so the exact
+  // failure point is visible (e.g. ?google=error&reason=token).
+  const fail = (reason) =>
+    res.redirect("/?google=error&reason=" + encodeURIComponent(reason || "unknown"));
+  const { code, error } = req.query || {};
+  if (error || typeof code !== "string" || !code) return fail("denied");
+  try {
+    const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        code,
+        client_id: GOOGLE_CLIENT_ID,
+        client_secret: GOOGLE_CLIENT_SECRET,
+        redirect_uri: GOOGLE_REDIRECT_URI,
+        grant_type: "authorization_code",
+      }),
+    });
+    const tokens = await tokenRes.json();
+    if (!tokens || !tokens.access_token) return fail("token");
+    const meRes = await fetch("https://openidconnect.googleapis.com/v1/userinfo", {
+      headers: { authorization: "Bearer " + tokens.access_token },
+    });
+    if (!meRes.ok) return fail("profile");
+    const profile = await meRes.json();
+    const email = String(profile && profile.email ? profile.email : "").trim().toLowerCase();
+    if (!email || (profile.email_verified !== undefined && profile.email_verified !== true)) {
+      return fail("email");
+    }
+    let user = findUserByEmail(email);
+    if (!user) {
+      const users = loadUsers();
+      const id = crypto.randomBytes(8).toString("hex");
+      user = { id, email, hash: null, google: true, credits: FREE_CREDITS, purchases: 0, createdAt: Date.now() };
+      users[id] = user;
+      saveUsers(users);
+    }
+    // Sign the session in directly here (this tab is first-party on this
+    // domain), so sign-in no longer depends on the opener tab's polling.
+    createSession(req, res, user.id);
+    const once = crypto.randomBytes(24).toString("hex");
+    pendingGoogle.set(once, {
+      userId: user.id,
+      state: typeof req.query.state === "string" ? req.query.state : null,
+      expires: Date.now() + 5 * 60 * 1000,
+    });
+    // Kept for older clients: the app polls /api/auth/google/status with its
+    // state value and then exchanges it via /api/auth/google/complete, which
+    // sets the session cookie while the app page is the top-level site.
+    res.send(googleDonePage());
+  } catch (e) {
+    fail("error");
+  }
+});
+
+// Polling endpoint: has the Google sign-in for this state finished?
+app.get("/api/auth/google/status", (req, res) => {
+  const state = req.query && req.query.state;
+  if (typeof state !== "string" || !state) return res.json({ done: false });
+  for (const entry of pendingGoogle.values()) {
+    if (entry.expires > Date.now() && entry.state === state) return res.json({ done: true });
+  }
+  res.json({ done: false });
+});
+
+app.post("/api/auth/google/complete", authRateLimit, (req, res) => {
+  const { token, state } = req.body || {};
+  let foundKey = null;
+  let entry = null;
+  if (typeof token === "string" && pendingGoogle.has(token)) {
+    foundKey = token;
+    entry = pendingGoogle.get(token);
+  } else if (typeof state === "string" && state) {
+    for (const [k, v] of pendingGoogle) {
+      if (v.state === state) {
+        foundKey = k;
+        entry = v;
+        break;
+      }
+    }
+  }
+  if (foundKey) pendingGoogle.delete(foundKey);
+  if (!entry || entry.expires < Date.now()) {
+    return res.status(400).json({ error: "Google sign-in expired. Please try again." });
+  }
+  const user = loadUsers()[entry.userId];
+  if (!user) return res.status(400).json({ error: "Account not found." });
+  createSession(req, res, user.id);
+  res.json({ ok: true, email: user.email, credits: user.credits });
+});
+
+app.get("/api/credits", (req, res) => {
+  const identity = resolveIdentity(req);
+  if (!identity) return res.status(400).json({ error: "Valid userId required." });
+  const credits = identity.user ? acctBalance(identity.user.id) : getBalance(identity.ledgerKey);
+  res.json({ credits, lowBalance: credits < LOW_BALANCE_THRESHOLD, lowBalanceThreshold: LOW_BALANCE_THRESHOLD });
+});
+
+// Live credit feed: recent transactions, newest first.
+app.get("/api/credits/history", (req, res) => {
+  const identity = resolveIdentity(req);
+  if (!identity) return res.status(400).json({ error: "Valid userId required." });
+  const key = identity.user ? "acct:" + identity.user.id : "ledger:" + identity.ledgerKey;
+  const credits = identity.user ? acctBalance(identity.user.id) : getBalance(identity.ledgerKey);
+  const history = (loadCreditHistory()[key] || []).slice(0, 20);
+  res.json({ credits, lowBalance: credits < LOW_BALANCE_THRESHOLD, history });
+});
+
+// Called by your payment webhook after a successful 100-credit purchase.
+// Grants the credits plus the every-3rd-purchase 150 bonus.
+// PRODUCTION: protect this with a webhook secret so only your payment
+// provider can call it.
+app.post("/api/purchase", (req, res) => {
+  const identity = resolveIdentity(req);
+  if (!identity) return res.status(400).json({ error: "Valid userId required." });
+  if (identity.user) {
+    const result = acctRecordPurchase(identity.user.id);
+    res.json({ ok: true, ...result });
+  } else {
+    const result = recordPurchase(identity.ledgerKey);
+    res.json({ ok: true, credits: getBalance(identity.ledgerKey), ...result });
+  }
+});
+
+// Publish a generated site and get a public URL back.
+// Publishing costs credits — publishing is the premium moment worth paying for.
+const PUBLISH_CREDITS = 40;
+app.post("/api/publish", (req, res) => {
+  const identity = resolveIdentity(req);
+  if (!identity) return res.status(401).json({ error: "Sign in to publish." });
+  const { html, title, projectId } = req.body || {};
+  if (!html || typeof html !== "string" || html.length < 100 || html.length > 500000) {
+    return res.status(400).json({ error: "Valid generated HTML required." });
+  }
+  // Charge for publishing up front.
+  const remaining = identity.user
+    ? acctSpend(identity.user.id, PUBLISH_CREDITS)
+    : spend(identity.ledgerKey, PUBLISH_CREDITS);
+  if (remaining === null) {
+    return res
+      .status(402)
+      .json({ error: `Publishing costs ${PUBLISH_CREDITS} credits. Top up to publish your site.` });
+  }
+  const refundPublish = () => {
+    if (identity.user) acctRefund(identity.user.id, PUBLISH_CREDITS);
+    else refund(identity.ledgerKey, PUBLISH_CREDITS);
+  };
+  let id, name;
+  try {
+    id = crypto.randomBytes(6).toString("hex");
+    name = assignName(typeof title === "string" ? title : "site");
+    const names = loadNames();
+    names[name] = id;
+    saveNames(names);
+    const dir = path.join(SITES_DIR, id);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "index.html"), html);
+    fs.writeFileSync(
+      path.join(dir, "meta.json"),
+      JSON.stringify(
+        {
+          id,
+          name,
+          owner: identity.user ? "acct:" + identity.user.id : identity.ledgerKey,
+          title: typeof title === "string" ? title.slice(0, 120) : "Untitled",
+          publishedAt: new Date().toISOString(),
+          expiresAt: Date.now() + UPKEEP_MS,
+        },
+        null,
+        2
+      )
+    );
+  } catch (e) {
+    refundPublish();
+    throw e;
+  }
+  // Link the published site back to its saved project, if provided.
+  if (typeof projectId === "string" && projectId) {
+    try {
+      const projects = loadProjects();
+      const ownerKey = identity.user ? "acct:" + identity.user.id : identity.ledgerKey;
+      const proj = projects[projectId];
+      if (proj && proj.owner === ownerKey) {
+        proj.siteId = id;
+        saveProjects(projects);
+      }
+    } catch (e) {
+      console.log("project link failed:", e.message);
+    }
+  }
+  res.json({
+    ok: true,
+    id,
+    name,
+    url: `/s/${id}/`,
+    domain: SITES_DOMAIN ? `https://${name}.${SITES_DOMAIN}` : null,
+    credits: remaining,
+    expiresAt: Date.now() + UPKEEP_MS,
+    upkeepCredits: UPKEEP_CREDITS,
+    upkeepDays: UPKEEP_DAYS,
+  });
+});
+
+// List the caller's published sites with their upkeep status.
+app.get("/api/sites", (req, res) => {
+  const identity = resolveIdentity(req);
+  if (!identity) return res.status(401).json({ error: "Sign in to view your sites." });
+  const owner = identity.user ? "acct:" + identity.user.id : identity.ledgerKey;
+  let ids = [];
+  try {
+    ids = fs.readdirSync(SITES_DIR).filter((f) => /^[a-f0-9]+$/.test(f));
+  } catch {}
+  const sites = [];
+  for (const id of ids) {
+    const meta = siteMeta(id);
+    if (!meta || meta.owner !== owner) continue;
+    const active = siteActive(meta); // grandfathers sites from before upkeep
+    sites.push({
+      id,
+      name: meta.name || null,
+      title: meta.title || "Untitled",
+      url: `/s/${id}/`,
+      domain: SITES_DOMAIN && meta.name ? `https://${meta.name}.${SITES_DOMAIN}` : null,
+      publishedAt: meta.publishedAt || null,
+      expiresAt: meta.expiresAt || null,
+      active,
+    });
+  }
+  sites.sort((a, b) => String(b.publishedAt || "").localeCompare(String(a.publishedAt || "")));
+  res.json({ ok: true, sites, upkeepCredits: UPKEEP_CREDITS, upkeepDays: UPKEEP_DAYS });
+});
+
+// Renew a published site for another 30 days. Costs upkeep credits.
+app.post("/api/sites/:id/renew", (req, res) => {
+  const identity = resolveIdentity(req);
+  if (!identity) return res.status(401).json({ error: "Sign in to renew." });
+  const { id } = req.params;
+  if (!/^[a-f0-9]+$/.test(id)) return res.status(404).json({ error: "Site not found." });
+  const meta = siteMeta(id);
+  if (!meta) return res.status(404).json({ error: "Site not found." });
+  const owner = identity.user ? "acct:" + identity.user.id : identity.ledgerKey;
+  if (meta.owner !== owner)
+    return res.status(403).json({ error: "Only the site owner can renew it." });
+  const remaining = identity.user
+    ? acctSpend(identity.user.id, UPKEEP_CREDITS)
+    : spend(identity.ledgerKey, UPKEEP_CREDITS);
+  if (remaining === null) {
+    return res.status(402).json({
+      error: `Renewal costs ${UPKEEP_CREDITS} credits. Top up to keep your site live.`,
+    });
+  }
+  const now = Date.now();
+  meta.expiresAt =
+    meta.expiresAt && meta.expiresAt > now ? meta.expiresAt + UPKEEP_MS : now + UPKEEP_MS;
+  writeSiteMeta(id, meta);
+  res.json({ ok: true, id, expiresAt: meta.expiresAt, credits: remaining });
+});
+
+// Streams generated text from Anthropic, calling onText for each chunk.
+// Returns the full text. Throws on provider errors.
+async function streamAnthropic(prompt, onText) {
+  const upstream = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: ANTHROPIC_MODEL,
+      max_tokens: MAX_TOKENS,
+      stream: true,
+      system: SYSTEM_PROMPT,
+      messages: [
+        { role: "user", content: `Build this website or web application:\n\n${prompt.trim()}` },
+      ],
+    }),
+  });
+
+  if (!upstream.ok || !upstream.body) {
+    const errText = await upstream.text().then((t) => t.slice(0, 300)).catch(() => "");
+    throw new Error(`AI provider error (${upstream.status}). ${errText}`);
+  }
+
+  const reader = upstream.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let fullText = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop(); // keep the incomplete line for next chunk
+    for (const line of lines) {
+      const t = line.trim();
+      if (!t.startsWith("data:")) continue;
+      const payload = t.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      let evt;
+      try {
+        evt = JSON.parse(payload);
+      } catch {
+        continue; // ignore partial JSON chunks
+      }
+      if (evt.type === "content_block_delta" && evt.delta && evt.delta.type === "text_delta") {
+        fullText += evt.delta.text;
+        onText(evt.delta.text);
+      } else if (evt.type === "error") {
+        throw new Error((evt.error && evt.error.message) || "AI provider error.");
+      }
+    }
+  }
+  return fullText;
+}
+
+// Streams generated text from Google Gemini (free tier via AI Studio),
+// calling onText for each chunk. Returns the full text. Throws on errors.
+// If the primary model is overloaded (503/429), falls back to the lighter model.
+async function streamGemini(prompt, onText) {
+  const models = [GEMINI_MODEL];
+  if (GEMINI_FALLBACK_MODEL && GEMINI_FALLBACK_MODEL !== GEMINI_MODEL) {
+    models.push(GEMINI_FALLBACK_MODEL);
+  }
+  let lastErr = null;
+  for (const model of models) {
+    try {
+      return await streamGeminiModel(model, prompt, onText);
+    } catch (e) {
+      lastErr = e;
+      if (!/AI provider error \((503|429)\)/.test(e.message)) throw e;
+      console.log(`Gemini model ${model} busy, trying fallback...`);
+    }
+  }
+  throw lastErr;
+}
+
+async function streamGeminiModel(model, prompt, onText) {
+  const url =
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
+  const upstream = await fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-goog-api-key": GEMINI_API_KEY,
+    },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+      contents: [
+        { role: "user", parts: [{ text: `Build this website or web application:\n\n${prompt.trim()}` }] },
+      ],
+      generationConfig: { temperature: 0.7, maxOutputTokens: MAX_TOKENS },
+    }),
+  });
+
+  if (!upstream.ok || !upstream.body) {
+    const errText = await upstream.text().then((t) => t.slice(0, 300)).catch(() => "");
+    throw new Error(`AI provider error (${upstream.status}). ${errText}`);
+  }
+
+  const reader = upstream.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let fullText = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    // SSE events are separated by a blank line: \n\n, \r\n\r\n, or \r\r
+    const events = buffer.split(/\r\n\r\n|\n\n|\r\r/);
+    buffer = events.pop(); // keep the incomplete event for next chunk
+    for (const event of events) {
+      for (const line of event.split("\n")) {
+        const t = line.trim();
+        if (!t.startsWith("data:")) continue;
+        const payload = t.slice(5).trim();
+        if (!payload || payload === "[DONE]") continue;
+        let evt;
+        try {
+          evt = JSON.parse(payload);
+        } catch {
+          continue; // ignore partial JSON chunks
+        }
+        const parts = (evt.candidates && evt.candidates[0] && evt.candidates[0].content && evt.candidates[0].content.parts) || [];
+        const text = parts.map((p) => p.text || "").join("");
+        if (text) {
+          fullText += text;
+          onText(text);
+        }
+      }
+    }
+  }
+  return fullText;
+}
+
+// Turns a short user request into a rich creative brief so the main
+// generation produces complete, GoDaddy-level sites. Never throws:
+// falls back to the original prompt when expansion fails.
+const BRIEF_PROMPT = `You turn short website requests into rich creative briefs for a web-designer AI. Given the user's request, output a concise brief covering: a great business/site name (invent one if none is given), industry, target audience, design style and mood, a suggested color palette (2-3 colors plus neutrals), the key sections the page must include, and 2-3 must-have features or interactive elements. Keep it under 200 words. Output ONLY the brief, no commentary.`;
+
+async function expandPrompt(prompt) {
+  try {
+    const model = GEMINI_FALLBACK_MODEL || GEMINI_MODEL;
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+    const upstream = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-goog-api-key": GEMINI_API_KEY },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: BRIEF_PROMPT }] },
+        contents: [{ role: "user", parts: [{ text: prompt.trim().slice(0, 500) }] }],
+        generationConfig: { temperature: 0.7, maxOutputTokens: 500 },
+      }),
+    });
+    if (!upstream.ok) return prompt;
+    const data = await upstream.json();
+    const cands = (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
+    const brief = cands.map((p) => p.text || "").join("").trim();
+    return brief.length > 40 ? brief : prompt;
+  } catch {
+    return prompt;
+  }
+}
+
+// Photo upload for the builder chat: JSON { image: "data:image/...;base64,..." }.
+// Returns { ok, url } with a public /uploads/... URL the generated site embeds.
+app.post("/api/uploads", authRateLimit, express.json({ limit: "8mb" }), (req, res) => {
+  const identity = resolveIdentity(req);
+  if (!identity) return res.status(400).json({ error: "Sign in to upload photos." });
+  const { image } = req.body || {};
+  const m = typeof image === "string" && image.match(/^data:(image\/(?:jpeg|png|webp|gif));base64,([A-Za-z0-9+/=]+)$/);
+  if (!m) return res.status(400).json({ error: "Send a JPEG, PNG, WebP, or GIF as a base64 data URL." });
+  const ext = UPLOAD_MIME[m[1]];
+  let buf;
+  try {
+    buf = Buffer.from(m[2], "base64");
+  } catch {
+    return res.status(400).json({ error: "Invalid image data." });
+  }
+  if (buf.length < 100 || buf.length > MAX_UPLOAD_BYTES) {
+    return res.status(400).json({ error: "Image must be under 5 MB." });
+  }
+  const file = crypto.randomBytes(12).toString("hex") + "." + ext;
+  fs.writeFileSync(path.join(UPLOADS_DIR, file), buf);
+  res.json({ ok: true, url: "/uploads/" + file });
+});
+
+// ---- Sabrina: free prompt coach ----
+// No credit cost. Rate-limited per user so it can't be abused.
+const COACH_SYSTEM = `You are Sabrina, the friendly AI helper inside the "AI Website Builder" app — an AI tool that builds complete websites from a chat prompt. Your job: help users write better prompts so they spend fewer credits. Pricing you know: 1 credit per new website build, 0.5 credits per follow-up correction, 40 credits to publish a site, 100 credits cost $12.99 one-time (no subscription). Keep answers short (2-4 sentences), warm, and practical. Give one concrete tip or an improved prompt when asked. Never claim to build the site yourself — building happens in the main chat. Never invent features the app doesn't have.`;
+
+const coachLimit = new Map(); // key -> { count, resetAt }
+function coachRateLimit(req, res, next) {
+  const identity = resolveIdentity(req);
+  const key = identity
+    ? (identity.user ? "acct:" + identity.user.id : "ledger:" + identity.ledgerKey)
+    : req.ip;
+  const now = Date.now();
+  let e = coachLimit.get(key);
+  if (!e || now > e.resetAt) e = { count: 0, resetAt: now + 60 * 60 * 1000 };
+  e.count += 1;
+  coachLimit.set(key, e);
+  if (e.count > 30) {
+    return res.status(429).json({ error: "Sabrina needs a breather — try again in a bit." });
+  }
+  next();
+}
+
+async function askGeminiOnce(systemText, userText) {
+  const url =
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+  const upstream = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-goog-api-key": GEMINI_API_KEY },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: systemText }] },
+      contents: [{ role: "user", parts: [{ text: userText }] }],
+      generationConfig: { temperature: 0.7, maxOutputTokens: 600 },
+    }),
+  });
+  if (!upstream.ok) throw new Error(`AI provider error (${upstream.status})`);
+  const data = await upstream.json();
+  const cands = (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
+  return cands.map((p) => p.text || "").join("").trim();
+}
+
+app.post("/api/coach", coachRateLimit, async (req, res) => {
+  if (!providerReady()) return res.status(500).json({ error: "Sabrina is unavailable right now." });
+  const identity = resolveIdentity(req);
+  if (!identity) return res.status(400).json({ error: "Valid userId required." });
+  const { message, history } = req.body || {};
+  if (!message || typeof message !== "string" || message.trim().length < 2 || message.length > 2000) {
+    return res.status(400).json({ error: "Send a message for Sabrina." });
+  }
+  const hist = Array.isArray(history)
+    ? history.slice(-8)
+        .filter((m) => m && typeof m.text === "string")
+        .map((m) => `${m.role === "sabrina" ? "Sabrina" : "User"}: ${m.text.slice(0, 500)}`)
+        .join("\n")
+    : "";
+  const userText = (hist ? `Conversation so far:\n${hist}\n\n` : "") + `User: ${message.trim()}`;
+  try {
+    const reply = await askGeminiOnce(COACH_SYSTEM, userText);
+    res.json({
+      reply: reply || "I'm here — tell me what you want your website to do and I'll help you say it in fewer credits.",
+    });
+  } catch (e) {
+    res.status(500).json({ error: "Sabrina couldn't answer just now. Try again in a moment." });
+  }
+});
+
+// ---- AI image generator ----
+// Images come from the free Pollinations service (no key needed); this backend
+// enforces the quotas: 8 free generations/day, or 30 credits for 30 days unlimited.
+const IMAGE_DAILY_FREE = 8;
+const IMAGE_UPGRADE_CREDITS = 30;
+const IMAGE_UPGRADE_DAYS = 30;
+const IMAGE_USAGE_PATH = path.join(__dirname, "image-usage.json");
+
+function loadImageUsage() {
+  try {
+    return JSON.parse(fs.readFileSync(IMAGE_USAGE_PATH, "utf8"));
+  } catch {
+    return {};
+  }
+}
+function saveImageUsage(u) {
+  fs.writeFileSync(IMAGE_USAGE_PATH, JSON.stringify(u, null, 2));
+}
+
+function imageQuota(user) {
+  const now = Date.now();
+  if (user.imagesUnlimitedUntil && user.imagesUnlimitedUntil > now) {
+    return { unlimited: true, remaining: Infinity, unlimitedUntil: user.imagesUnlimitedUntil };
+  }
+  const usage = loadImageUsage();
+  const key = "acct:" + user.id;
+  const today = new Date().toISOString().slice(0, 10);
+  const entry = usage[key];
+  const used = entry && entry.date === today ? entry.count : 0;
+  return { unlimited: false, remaining: Math.max(0, IMAGE_DAILY_FREE - used), unlimitedUntil: null };
+}
+
+function imageUrlFor(prompt) {
+  const seed = Math.floor(Math.random() * 1000000);
+  return `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt.slice(0, 500))}?width=1024&height=1024&nologo=true&seed=${seed}`;
+}
+
+app.get("/api/images/status", (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return res.status(401).json({ error: "Sign in to generate images." });
+  res.json({ ok: true, ...imageQuota(user) });
+});
+
+app.post("/api/image", (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return res.status(401).json({ error: "Sign in to generate images." });
+  const { prompt } = req.body || {};
+  if (!prompt || typeof prompt !== "string" || prompt.trim().length < 3 || prompt.length > 500) {
+    return res.status(400).json({ error: "Describe the image (3-500 characters)." });
+  }
+  const quota = imageQuota(user);
+  if (!quota.unlimited && quota.remaining <= 0) {
+    return res.status(402).json({ error: "Come back tomorrow for free images — or get unlimited for 30 days.", needUpgrade: true });
+  }
+  if (!quota.unlimited) {
+    const usage = loadImageUsage();
+    const key = "acct:" + user.id;
+    const today = new Date().toISOString().slice(0, 10);
+    const entry = usage[key];
+    if (entry && entry.date === today) entry.count += 1;
+    else usage[key] = { date: today, count: 1 };
+    saveImageUsage(usage);
+  }
+  const after = imageQuota(user);
+  res.json({ ok: true, url: imageUrlFor(prompt), remaining: after.remaining, unlimited: after.unlimited });
+});
+
+app.post("/api/images/upgrade", (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return res.status(401).json({ error: "Sign in first." });
+  const users = loadUsers();
+  const u = users[user.id];
+  if (!u) return res.status(404).json({ error: "Account not found." });
+  const now = Date.now();
+  if (u.imagesUnlimitedUntil && u.imagesUnlimitedUntil > now) {
+    return res.status(400).json({ error: "You already have unlimited images.", unlimitedUntil: u.imagesUnlimitedUntil });
+  }
+  if (u.credits < IMAGE_UPGRADE_CREDITS) {
+    return res.status(402).json({ error: `Unlimited images cost ${IMAGE_UPGRADE_CREDITS} credits. Top up first.` });
+  }
+  u.credits -= IMAGE_UPGRADE_CREDITS;
+  u.imagesUnlimitedUntil = now + IMAGE_UPGRADE_DAYS * 24 * 60 * 60 * 1000;
+  saveUsers(users);
+  logCreditTx("acct:" + u.id, -IMAGE_UPGRADE_CREDITS, "unlimited images 30 days", u.credits);
+  res.json({ ok: true, unlimitedUntil: u.imagesUnlimitedUntil, credits: u.credits });
+});
+
+app.post("/api/generate", async (req, res) => {
+  if (!providerReady()) {
+    return res.status(500).json({ error: `Server misconfigured: ${providerKeyName()} is not set.` });
+  }
+  const { prompt, images, refinement } = req.body || {};
+  const identity = resolveIdentity(req);
+  if (!identity) return res.status(400).json({ error: "Valid userId required." });
+  if (!prompt || typeof prompt !== "string" || prompt.trim().length < 3) {
+    return res.status(400).json({ error: "Provide a 'prompt' describing the site to build." });
+  }
+  // Follow-up corrections cost less than a full fresh build.
+  const buildCost = refinement === true ? CREDITS_PER_REFINEMENT : CREDITS_PER_BUILD;
+  // User-uploaded photos (from /api/uploads) to feature on the site.
+  const userImages = Array.isArray(images)
+    ? images.filter((u) => typeof u === "string" && u.startsWith("/uploads/")).slice(0, 6)
+    : [];
+
+  // Charge credits up front so nobody builds for free.
+  const spendReason = refinement === true ? "correction" : "build";
+  const remaining = identity.user
+    ? acctSpend(identity.user.id, buildCost, spendReason)
+    : spend(identity.ledgerKey, buildCost, spendReason);
+  if (remaining === null) {
+    return res.status(402).json({ error: "Not enough credits. Top up to keep building." });
+  }
+  const identRefund = () => {
+    if (identity.user) acctRefund(identity.user.id, buildCost, spendReason + " refund");
+    else refund(identity.ledgerKey, buildCost, spendReason + " refund");
+  };
+  const identBalance = () =>
+    identity.user ? acctBalance(identity.user.id) : getBalance(identity.ledgerKey);
+
+  // Stream progress back to the browser as server-sent events.
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+  });
+  const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  send("start", { credits: remaining });
+
+  try {
+    // Expand short prompts into a rich brief first (no extra credit cost).
+    // This is what lifts a 3-word request to a GoDaddy-level, complete site.
+    send("status", { message: "Planning your site..." });
+    const brief = await expandPrompt(prompt);
+    const fullPrompt =
+      brief && brief.trim() !== prompt.trim()
+        ? `User request: ${prompt.trim()}\n\nDesign brief:\n${brief.trim()}`
+        : prompt;
+    const photoNote = userImages.length
+      ? `\n\nThe user uploaded ${userImages.length} real photo(s) for this site — feature them prominently in the most fitting spots (hero, about, gallery, products). Reference each URL EXACTLY as given, e.g. <img src="${userImages[0]}" alt="...">:\n${userImages.map((u) => "- " + u).join("\n")}`
+      : "";
+    const buildPrompt = fullPrompt + photoNote;
+    const onText = (text) => send("delta", { text });
+    const fullText =
+      AI_PROVIDER === "gemini"
+        ? await streamGemini(buildPrompt, onText)
+        : await streamAnthropic(buildPrompt, onText);
+
+    const html = extractHtml(fullText);
+    // If the model stopped mid-page, continue where it left off (up to 2
+    // continuations) so the site is always complete and usable.
+    let completeText = fullText;
+    let completeHtml = html;
+    for (let i = 0; i < 2 && !isCompleteHtml(completeHtml); i++) {
+      send("status", { message: "Finishing your site..." });
+      try {
+        completeText += await continueGeneration(completeText, onText);
+      } catch (e) {
+        console.error("Continuation failed:", e.message);
+        break;
+      }
+      completeHtml = extractHtml(completeText);
+    }
+    const finalHtml = injectImageGuardian(completeHtml);
+    // Keep every successful build as a saved project (draft).
+    saveProject(identity.user ? "acct:" + identity.user.id : identity.ledgerKey, prompt, finalHtml);
+    send("done", { html: finalHtml, credits: identBalance() });
+    res.end();
+  } catch (err) {
+    identRefund(); // provider failed: give the credits back
+    console.error("Generation failed:", err.message);
+    send("error", { error: `${err.message || "Generation failed."} Credits refunded.` });
+    res.end();
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`AI Website Builder backend running on http://localhost:${PORT}`);
+  console.log(`AI provider: ${AI_PROVIDER} (${AI_PROVIDER === "gemini" ? GEMINI_MODEL : ANTHROPIC_MODEL})`);
+  if (!providerReady()) {
+    console.log(`WARNING: ${providerKeyName()} is not set. Copy .env.example to .env and add your key.`);
+  }
+});
