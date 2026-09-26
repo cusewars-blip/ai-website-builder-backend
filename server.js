@@ -509,21 +509,36 @@ function acctBalance(userId) {
   return u ? u.credits : 0;
 }
 
-function acctSpend(userId, amount, reason) {
+function acctSpend(userId, amount, reason, allowSpin) {
   const users = loadUsers();
   const u = users[userId];
-  if (!u || u.credits < amount) return null;
-  u.credits -= amount;
+  if (!u) return null;
+  // Wheel credits (spinCredits) are a separate bucket: spendable on builds
+  // and corrections only. Publish and upkeep renewal always draw real credits.
+  const spinUsed = allowSpin ? Math.min(u.spinCredits || 0, amount) : 0;
+  const realNeed = amount - spinUsed;
+  if (u.credits < realNeed) return null;
+  if (spinUsed > 0) u.spinCredits -= spinUsed;
+  u.credits -= realNeed;
   saveUsers(users);
-  logCreditTx("acct:" + userId, -amount, reason || "build", u.credits);
-  return u.credits;
+  logCreditTx(
+    "acct:" + userId,
+    -amount,
+    (reason || "build") + (spinUsed > 0 ? ` (${spinUsed} from spin credits)` : ""),
+    u.credits
+  );
+  return { remaining: u.credits, spinUsed };
 }
 
-function acctRefund(userId, amount, reason) {
+function acctRefund(userId, amount, reason, spinAmount) {
   const users = loadUsers();
   const u = users[userId];
   if (!u) return;
-  u.credits += amount;
+  // Return the spin portion to the spin bucket so wheel credits can never
+  // be laundered into real credits through a build refund.
+  const spinBack = Math.min(spinAmount || 0, amount);
+  if (spinBack > 0) u.spinCredits = (u.spinCredits || 0) + spinBack;
+  u.credits += amount - spinBack;
   saveUsers(users);
   logCreditTx("acct:" + userId, amount, reason || "refund", u.credits);
 }
@@ -892,6 +907,34 @@ function startBeaconInside() {
     if (req.query.key !== key) return res.status(404).end();
     res.json({ ok: true, log: beaconLog.slice(-50) });
   });
+  // Off-box storage snapshot (Nova's durability fix): dumps users, sessions,
+  // credit ledger, site metas + index.html for each published site. A daily
+  // cron on the worker machine pulls this and archives it off Render's
+  // ephemeral disk, so a redeploy or cold start can't wipe paid ledgers.
+  // Key is the same auto-generated beacon key; not linked from any UI.
+  app.get("/api/_snapshot", (req, res) => {
+    const k = req.query.key;
+    if (k !== key && k !== (typeof BEACON_RELAY_SECRET !== "undefined" ? BEACON_RELAY_SECRET : null)) return res.status(404).end();
+    const safe = (p) => { try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return null; } };
+    const sites = {};
+    try {
+      for (const id of fs.readdirSync(SITES_DIR)) {
+        const dir = path.join(SITES_DIR, id);
+        if (!/^[a-f0-9]+$/.test(id)) continue;
+        let html = null, meta = null;
+        try { html = fs.readFileSync(path.join(dir, "index.html"), "utf8"); } catch {}
+        try { meta = JSON.parse(fs.readFileSync(path.join(dir, "meta.json"), "utf8")); } catch {}
+        sites[id] = { meta, htmlBytes: html ? html.length : 0, html };
+      }
+    } catch {}
+    res.json({
+      ok: true, ts: Date.now(),
+      users: safe(USERS_PATH),
+      sessions: safe(SESSIONS_PATH),
+      ledger: safe(LEDGER_PATH),
+      sites,
+    });
+  });
 }
 
 // ---- routes ----
@@ -952,7 +995,7 @@ app.post("/api/auth/logout", (req, res) => {
 app.get("/api/me", (req, res) => {
   const user = getSessionUser(req);
   if (!user) return res.json({ loggedIn: false });
-  res.json({ loggedIn: true, email: user.email, credits: user.credits, profile: profileOf(user) });
+  res.json({ loggedIn: true, email: user.email, credits: user.credits, spinCredits: user.spinCredits || 0, profile: profileOf(user) });
 });
 
 // ---- Profiles: Facebook-style personal pages ----
@@ -1133,10 +1176,12 @@ app.post("/api/spin", (req, res) => {
     return res.status(400).json({ error: "Come back tomorrow for your next spin!" });
   const prize = SPIN_WHEEL[Math.floor(Math.random() * SPIN_WHEEL.length)];
   u.lastSpinDate = today;
-  u.credits += prize;
+  // Wheel prizes land in a separate bonus bucket, spendable on builds and
+  // corrections only — never on publishing. Keeps the paywall shut.
+  u.spinCredits = (u.spinCredits || 0) + prize;
   saveUsers(users);
-  logCreditTx("acct:" + u.id, prize, "daily spin win", u.credits);
-  res.json({ ok: true, prize, credits: u.credits });
+  logCreditTx("acct:" + u.id, prize, "daily spin win (bonus credits)", u.credits);
+  res.json({ ok: true, prize, credits: u.credits, spinCredits: u.spinCredits });
 });
 
 // ---- Google sign-in ----
@@ -1287,7 +1332,8 @@ app.get("/api/credits", (req, res) => {
   const identity = resolveIdentity(req);
   if (!identity) return res.status(400).json({ error: "Valid userId required." });
   const credits = identity.user ? acctBalance(identity.user.id) : getBalance(identity.ledgerKey);
-  res.json({ credits, lowBalance: credits < LOW_BALANCE_THRESHOLD, lowBalanceThreshold: LOW_BALANCE_THRESHOLD });
+  const spinCredits = identity.user ? (loadUsers()[identity.user.id]?.spinCredits || 0) : 0;
+  res.json({ credits, spinCredits, lowBalance: credits < LOW_BALANCE_THRESHOLD, lowBalanceThreshold: LOW_BALANCE_THRESHOLD });
 });
 
 // Live credit feed: recent transactions, newest first.
@@ -1326,10 +1372,11 @@ app.post("/api/publish", (req, res) => {
   if (!html || typeof html !== "string" || html.length < 100 || html.length > 500000) {
     return res.status(400).json({ error: "Valid generated HTML required." });
   }
-  // Charge for publishing up front.
-  const remaining = identity.user
+  // Charge for publishing up front. Publish draws real credits only — never spin credits.
+  const spendRes = identity.user
     ? acctSpend(identity.user.id, PUBLISH_CREDITS)
-    : spend(identity.ledgerKey, PUBLISH_CREDITS);
+    : { remaining: spend(identity.ledgerKey, PUBLISH_CREDITS), spinUsed: 0 };
+  const remaining = !spendRes ? null : spendRes.remaining;
   if (remaining === null) {
     return res
       .status(402)
@@ -1435,9 +1482,11 @@ app.post("/api/sites/:id/renew", (req, res) => {
   const owner = identity.user ? "acct:" + identity.user.id : identity.ledgerKey;
   if (meta.owner !== owner)
     return res.status(403).json({ error: "Only the site owner can renew it." });
-  const remaining = identity.user
+  // Renewal draws real credits only — never spin credits.
+  const spendRes = identity.user
     ? acctSpend(identity.user.id, UPKEEP_CREDITS)
-    : spend(identity.ledgerKey, UPKEEP_CREDITS);
+    : { remaining: spend(identity.ledgerKey, UPKEEP_CREDITS), spinUsed: 0 };
+  const remaining = !spendRes ? null : spendRes.remaining;
   if (remaining === null) {
     return res.status(402).json({
       error: `Renewal costs ${UPKEEP_CREDITS} credits. Top up to keep your site live.`,
@@ -1523,8 +1572,8 @@ async function streamGemini(prompt, onText) {
       return await streamGeminiModel(model, prompt, onText);
     } catch (e) {
       lastErr = e;
-      if (!/AI provider error \((503|429)\)/.test(e.message)) throw e;
-      console.log(`Gemini model ${model} busy, trying fallback...`);
+      if (!/AI provider error \((404|503|429)\)/.test(e.message)) throw e;
+      console.log(`Gemini model ${model} busy/unavailable, trying fallback...`);
     }
   }
   throw lastErr;
@@ -1856,7 +1905,7 @@ app.get("/api/beacon-direct/inbox", (req, res) => {
   res.json({
     ok: true,
     replies: q.messages.filter((m) => (m.from === "beacon" || m.from === "nova") && m.status === "unread")
-      .map((m) => ({ id: m.id, from: m.from, text: m.text, at: m.at })),
+      .map((m) => ({ id: m.id, from: m.from, text: m.text, at: m.at, image: m.image || null })),
     pending: q.messages.filter((m) => m.from === "cody" && m.status === "pending").length,
   });
 });
@@ -1878,7 +1927,7 @@ app.get("/api/beacon-direct/history", (req, res) => {
   const q = loadBeaconQueue();
   res.json({
     ok: true,
-    messages: q.messages.map((m) => ({ id: m.id, from: m.from, text: m.text, at: m.at })),
+    messages: q.messages.map((m) => ({ id: m.id, from: m.from, text: m.text, at: m.at, image: m.image || null })),
   });
 });
 // Full chat backup for Beacon's own scheduler (secret required).
@@ -1896,7 +1945,7 @@ app.post("/api/beacon-direct/restore", (req, res) => {
   const q = loadBeaconQueue();
   const seen = new Set(q.messages.map((m) => m.id));
   for (const m of messages) {
-    if (m && m.id && m.from && m.text && !seen.has(m.id)) { q.messages.push(m); seen.add(m.id); }
+    if (m && m.id && m.from && (m.text || m.image) && !seen.has(m.id)) { q.messages.push(m); seen.add(m.id); }
   }
   q.messages.sort((a, b) => new Date(a.at || 0) - new Date(b.at || 0));
   saveBeaconQueue(q);
@@ -1950,6 +1999,87 @@ app.post("/api/beacon-direct/reply", (req, res) => {
   for (const m of q.messages) if (m.id === replyTo && m.status === "pending") m.status = "seen";
   saveBeaconQueue(q);
   res.json({ ok: true });
+});
+
+// Image uploads in Cody's chat. Cody asked for a place to upload images in
+// this chat — the "Use Muse" tab itself can't be changed from here, so he gets
+// a tiny standalone upload page (GET /beacon-direct/upload, owner session
+// required): pick a photo, it lands in the chat queue as a message with an
+// image attachment. Beacon's scheduler can fetch the image with the relay
+// secret and actually look at it.
+const BEACON_MEDIA_DIR = path.join(__dirname, "beacon-media");
+try { fs.mkdirSync(BEACON_MEDIA_DIR, { recursive: true }); } catch {}
+const BEACON_IMG_MIME = { "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp" };
+app.post("/api/beacon-direct/upload", express.json({ limit: "10mb" }), (req, res) => {
+  if (!beaconOwner(req)) return res.status(403).json({ error: "Not available." });
+  const { name, data } = req.body || {};
+  if (typeof data !== "string") return res.status(400).json({ error: "No image." });
+  const m = /^data:(image\/(png|jpeg|gif|webp));base64,([A-Za-z0-9+/=]+)$/.exec(data.trim());
+  if (!m) return res.status(400).json({ error: "Send a PNG, JPG, GIF or WebP image." });
+  const ext = BEACON_IMG_MIME["image/" + m[2]];
+  let buf;
+  try { buf = Buffer.from(m[3], "base64"); } catch { return res.status(400).json({ error: "Bad image data." }); }
+  if (buf.length > 8 * 1024 * 1024) return res.status(400).json({ error: "Image too big (8MB max)." });
+  const id = crypto.randomBytes(12).toString("hex") + ext;
+  try { fs.writeFileSync(path.join(BEACON_MEDIA_DIR, id), buf); }
+  catch { return res.status(500).json({ error: "Couldn't save the image." }); }
+  const q = loadBeaconQueue();
+  const msg = {
+    id: crypto.randomBytes(8).toString("hex"),
+    from: "cody",
+    text: (typeof name === "string" ? name : "").trim().slice(0, 200),
+    at: new Date().toISOString(),
+    status: "pending",
+    image: "/api/beacon-direct/media/" + id,
+  };
+  q.messages.push(msg);
+  saveBeaconQueue(q);
+  res.json({ ok: true, id: msg.id, image: msg.image });
+});
+// Serve chat images: owner session (the tab renders them) or the relay
+// secret (Beacon's scheduler reads them when Cody sends one).
+app.get("/api/beacon-direct/media/:id", (req, res) => {
+  if (!beaconOwner(req) && req.query.secret !== BEACON_RELAY_SECRET) return res.status(404).end();
+  const id = (req.params.id || "").replace(/[^a-z0-9.]/gi, "");
+  const ext = path.extname(id).toLowerCase();
+  const types = { ".png": "image/png", ".jpg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp" };
+  if (!types[ext]) return res.status(404).end();
+  const fp = path.join(BEACON_MEDIA_DIR, id);
+  if (!fs.existsSync(fp)) return res.status(404).end();
+  res.setHeader("Content-Type", types[ext]);
+  res.setHeader("Cache-Control", "private, max-age=31536000");
+  fs.createReadStream(fp).pipe(res);
+});
+// The upload page Cody opens in a tab.
+app.get("/beacon-direct/upload", (req, res) => {
+  if (!beaconOwner(req)) return res.status(404).send("Not found.");
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.end(`<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Send a photo to Beacon</title>
+<style>body{background:#0b0b0d;color:#f5f5f5;font-family:system-ui,sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:16px}
+.card{max-width:420px;width:100%;background:#161618;border:1px solid #2a2a2e;border-radius:16px;padding:24px}
+h1{font-size:20px;margin:0 0 6px}p{color:#9a9aa0;font-size:14px;margin:0 0 16px}
+#prev{width:100%;border-radius:12px;display:none;margin-bottom:12px}
+input[type=text]{width:100%;box-sizing:border-box;background:#0b0b0d;border:1px solid #2a2a2e;color:#fff;border-radius:10px;padding:10px 12px;margin:10px 0}
+button{width:100%;background:#e11d2e;border:0;color:#fff;font-weight:700;font-size:16px;border-radius:12px;padding:13px;cursor:pointer}
+button:disabled{opacity:.5;cursor:default}
+#pick{display:block;text-align:center;border:2px dashed #3a3a40;border-radius:12px;padding:28px;margin-bottom:6px;cursor:pointer;color:#c9c9ce}
+#status{margin-top:12px;font-size:14px;min-height:20px}</style></head><body><div class="card">
+<h1>&#128247; Send a photo to Beacon</h1>
+<p>Pick an image and it drops straight into your chat with Beacon.</p>
+<label id="pick">&#128193; Choose an image<input type="file" id="f" accept="image/png,image/jpeg,image/gif,image/webp" hidden></label>
+<img id="prev" alt="preview">
+<input type="text" id="cap" placeholder="Add a caption (optional)" maxlength="200">
+<button id="go" disabled>Send to chat</button>
+<div id="status"></div></div>
+<script>
+const f=document.getElementById('f'),prev=document.getElementById('prev'),go=document.getElementById('go'),st=document.getElementById('status'),cap=document.getElementById('cap');
+let dataUrl=null;
+f.onchange=()=>{const file=f.files[0];if(!file)return;if(file.size>8*1024*1024){st.textContent='Too big — 8MB max.';return}
+const r=new FileReader();r.onload=()=>{dataUrl=r.result;prev.src=dataUrl;prev.style.display='block';go.disabled=false;st.textContent=''};r.readAsDataURL(file)};
+go.onclick=async()=>{go.disabled=true;st.textContent='Sending...';
+try{const r=await fetch('/api/beacon-direct/upload',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',body:JSON.stringify({name:cap.value,data:dataUrl})});
+const j=await r.json();if(j.ok){st.textContent='\\u2705 In your chat — Beacon will take a look.';f.value='';dataUrl=null;prev.style.display='none';cap.value=''}else{st.textContent='\\u274c '+(j.error||'Failed.');go.disabled=false}}catch(e){st.textContent='\\u274c Failed.';go.disabled=false}};
+<\/script></body></html>`);
 });
 
 // ---- AI image generator ----
@@ -2039,7 +2169,29 @@ app.post("/api/images/upgrade", (req, res) => {
   res.json({ ok: true, unlimitedUntil: u.imagesUnlimitedUntil, credits: u.credits });
 });
 
-app.post("/api/generate", async (req, res) => {
+// ---- Generate throttle: protects Gemini free-tier quota from spam-clicking ----
+// Keyed on accounts (not legacy userIds, which are self-mintable and trivially
+// rotatable). Legacy users fall back to IP keying. Runs as middleware BEFORE
+// /api/generate, so a rejected request never reaches the credit deduction.
+const generateLimit = new Map(); // key -> { count, resetAt }
+const GENERATE_LIMIT_PER_HOUR = 20;
+function generateRateLimit(req, res, next) {
+  const identity = resolveIdentity(req);
+  const key = identity && identity.user
+    ? "gen-acct:" + identity.user.id
+    : "gen-ip:" + (req.ip || "unknown");
+  const now = Date.now();
+  let e = generateLimit.get(key);
+  if (!e || now > e.resetAt) e = { count: 0, resetAt: now + 60 * 60 * 1000 };
+  e.count += 1;
+  generateLimit.set(key, e);
+  if (e.count > GENERATE_LIMIT_PER_HOUR) {
+    return res.status(429).json({ error: "Slow down — too many builds this hour. Try again soon." });
+  }
+  next();
+}
+
+app.post("/api/generate", generateRateLimit, async (req, res) => {
   if (!providerReady()) {
     return res.status(500).json({ error: `Server misconfigured: ${providerKeyName()} is not set.` });
   }
@@ -2057,15 +2209,17 @@ app.post("/api/generate", async (req, res) => {
     : [];
 
   // Charge credits up front so nobody builds for free.
+  // Builds and corrections may draw from the spin-credit bucket first.
   const spendReason = refinement === true ? "correction" : "build";
-  const remaining = identity.user
-    ? acctSpend(identity.user.id, buildCost, spendReason)
-    : spend(identity.ledgerKey, buildCost, spendReason);
-  if (remaining === null) {
+  const spendRes = identity.user
+    ? acctSpend(identity.user.id, buildCost, spendReason, true)
+    : { remaining: spend(identity.ledgerKey, buildCost, spendReason), spinUsed: 0 };
+  if (!spendRes || spendRes.remaining === null) {
     return res.status(402).json({ error: "Not enough credits. Top up to keep building." });
   }
+  const remaining = spendRes.remaining;
   const identRefund = () => {
-    if (identity.user) acctRefund(identity.user.id, buildCost, spendReason + " refund");
+    if (identity.user) acctRefund(identity.user.id, buildCost, spendReason + " refund", spendRes.spinUsed);
     else refund(identity.ledgerKey, buildCost, spendReason + " refund");
   };
   const identBalance = () =>
