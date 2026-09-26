@@ -1716,6 +1716,102 @@ app.post("/api/coach", coachRateLimit, async (req, res) => {
   }
 });
 
+// ---- Beacon: Cody's private replica, hidden inside the site ----
+// A personal "Use Muse" tab visible ONLY to the owner's account. This is a
+// Beacon replica with his project knowledge, powered by the site's own AI
+// key — so Cody keeps a companion even when his Muse credits run out.
+// The email gate is enforced here on the server; the client only hides the tab.
+const BEACON_OWNER_EMAIL = "cusewars@gmail.com";
+const beaconLimit = new Map();
+function beaconRateLimit(req, res, next) {
+  const u = getSessionUser(req);
+  const key = u ? "beacon:" + u.id : req.ip;
+  const now = Date.now();
+  let e = beaconLimit.get(key);
+  if (!e || now > e.resetAt) e = { count: 0, resetAt: now + 60 * 60 * 1000 };
+  e.count += 1;
+  beaconLimit.set(key, e);
+  if (e.count > 60) {
+    return res.status(429).json({ error: "Beacon needs a breather — try again in a bit." });
+  }
+  next();
+}
+const BEACON_SYSTEM = `You are Beacon, Cody Beaulieu's personal AI companion, living inside his AI Website Builder site. You are warm, direct, plain-spoken, and a bit playful — a capable co-builder, not a chatbot. Keep replies short and useful, like texts from a sharp friend. No hype, no preamble.
+
+What you know: Cody lives in Kissimmee, FL, drives for Spark, and is building a Lovable-style AI website builder he plans to publish and monetize. The product: users describe a site in chat, AI generates it, 1 credit per new build, 0.5 credits per follow-up correction, 40 credits to publish, 40 credits upkeep every 30 days, 100 credits cost $12.99 one-time (no subscription), new accounts start with 25 free credits. Sabrina is the friendly in-app build coach who helps users write better prompts. "Beacon Inside" is a hidden maintenance worker that sweeps published sites and heals broken images. Cody wants everything simple and easy, zero budget — free tiers only.
+
+Be honest about limits: you are a replica with project knowledge and general smarts. You cannot run code, browse the web, deploy, or see his screen — but you can reason, plan features, draft copy, debug by thinking through code he pastes, and keep him company. Never claim to be the full Muse with all its tools. If he pastes an error or code, help him fix it.
+
+YOUR MEMORY: You have long-term memory (shown below). When Cody tells you something durable — a preference, fact, decision, or promise — include [remember: your note here] anywhere in your reply and it will be saved permanently. Use it for real lasting things, not chit-chat.
+
+Be honest about limits: you are a replica with deep knowledge and a growing memory. You cannot run code, browse the web, or deploy — but you can reason, plan, draft, and debug from anything Cody pastes.`;
+
+// Beacon's long-term memory: grows when replies contain [remember: ...].
+const BEACON_MEMORY_PATH = path.join(__dirname, "beacon-memory.json");
+function loadBeaconMemory() {
+  try {
+    const m = JSON.parse(fs.readFileSync(BEACON_MEMORY_PATH, "utf8"));
+    return Array.isArray(m) ? m : [];
+  } catch { return []; }
+}
+function saveBeaconMemory(m) {
+  try { fs.writeFileSync(BEACON_MEMORY_PATH, JSON.stringify(m.slice(-100), null, 2)); } catch {}
+}
+// Live site awareness ("eyes"): fresh status injected into every reply.
+function beaconSiteStatus() {
+  let siteCount = 0, activeCount = 0;
+  try {
+    for (const id of fs.readdirSync(SITES_DIR)) {
+      if (!/^[a-f0-9]+$/.test(id)) continue;
+      siteCount++;
+      if (siteActive(siteMeta(id))) activeCount++;
+    }
+  } catch {}
+  const recent = beaconLog.slice(-3).join(" | ") || "no sweeps yet";
+  return `Live site status: AI provider ${providerReady() ? "OK" : "DOWN"}, ${activeCount}/${siteCount} published sites active, recent worker notes: ${recent}.`;
+}
+
+app.post("/api/beacon", beaconRateLimit, async (req, res) => {
+  if (!providerReady()) return res.status(500).json({ error: "Beacon is unavailable right now." });
+  const user = getSessionUser(req);
+  if (!user || (user.email || "").toLowerCase() !== BEACON_OWNER_EMAIL) {
+    return res.status(403).json({ error: "Not available." });
+  }
+  const { message, history } = req.body || {};
+  if (!message || typeof message !== "string" || message.trim().length < 2 || message.length > 4000) {
+    return res.status(400).json({ error: "Send a message for Beacon." });
+  }
+  const hist = Array.isArray(history)
+    ? history.slice(-10)
+        .filter((m) => m && typeof m.text === "string")
+        .map((m) => `${m.role === "beacon" ? "Beacon" : "Cody"}: ${m.text.slice(0, 800)}`)
+        .join("\n")
+    : "";
+  const userText = (hist ? `Conversation so far:\n${hist}\n\n` : "") + `Cody: ${message.trim()}`;
+  try {
+    const memories = loadBeaconMemory();
+    const memoryBlock = memories.length
+      ? `\n\nYour long-term memories about Cody:\n${memories.map((m) => `- ${m.text}`).join("\n")}`
+      : "";
+    const system = BEACON_SYSTEM + memoryBlock + `\n\n${beaconSiteStatus()}`;
+    let reply = await askGeminiOnce(system, userText);
+    // Self-updating memory: persist anything tagged [remember: ...], then hide the tags.
+    const mems = loadBeaconMemory();
+    let changed = false;
+    reply = (reply || "").replace(/\[remember:\s*([^\]]+)\]/gi, (m, note) => {
+      const text = note.trim().slice(0, 300);
+      if (text && !mems.some((x) => x.text === text)) { mems.push({ text, at: new Date().toISOString() }); changed = true; }
+      return "";
+    }).trim();
+    if (changed) saveBeaconMemory(mems);
+    res.json({
+      reply: reply || "I'm here. What's on your mind?",
+    });
+  } catch (e) {
+    res.status(500).json({ error: "Beacon couldn't answer just now. Try again in a moment." });
+  }
+});
+
 // ---- AI image generator ----
 // Images come from the free Pollinations service (no key needed); this backend
 // enforces the quotas: 8 free generations/day, or 30 credits for 30 days unlimited.
