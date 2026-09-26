@@ -1872,6 +1872,36 @@ app.post("/api/beacon-direct/ack", (req, res) => {
   if (changed) saveBeaconQueue(q);
   res.json({ ok: true });
 });
+// Full chat history for the tab (owner session required). Called once on tab open.
+app.get("/api/beacon-direct/history", (req, res) => {
+  if (!beaconOwner(req)) return res.status(403).json({ error: "Not available." });
+  const q = loadBeaconQueue();
+  res.json({
+    ok: true,
+    messages: q.messages.map((m) => ({ id: m.id, from: m.from, text: m.text, at: m.at })),
+  });
+});
+// Full chat backup for Beacon's own scheduler (secret required).
+// The queue file lives on the server's ephemeral disk — server updates wipe
+// it. So Beacon's 5-minute pickup also backs the chat up to his own
+// persistent storage and restores it if the server ever comes back empty.
+app.get("/api/beacon-direct/backup", (req, res) => {
+  if (req.query.secret !== BEACON_RELAY_SECRET) return res.status(404).end();
+  res.json({ ok: true, messages: loadBeaconQueue().messages });
+});
+app.post("/api/beacon-direct/restore", (req, res) => {
+  const { secret, messages } = req.body || {};
+  if (secret !== BEACON_RELAY_SECRET) return res.status(404).end();
+  if (!Array.isArray(messages)) return res.status(400).json({ error: "Bad backup." });
+  const q = loadBeaconQueue();
+  const seen = new Set(q.messages.map((m) => m.id));
+  for (const m of messages) {
+    if (m && m.id && m.from && m.text && !seen.has(m.id)) { q.messages.push(m); seen.add(m.id); }
+  }
+  q.messages.sort((a, b) => new Date(a.at || 0) - new Date(b.at || 0));
+  saveBeaconQueue(q);
+  res.json({ ok: true, count: q.messages.length });
+});
 // Beacon's scheduler picks up Cody's pending messages (secret required).
 app.get("/api/beacon-direct/queue", (req, res) => {
   if (req.query.secret !== BEACON_RELAY_SECRET) return res.status(404).end();
