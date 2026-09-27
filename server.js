@@ -2104,6 +2104,40 @@ app.post("/api/admin/grant-credits", (req, res) => {
   res.json({ ok: true, email: user.email, idemKey, ...result });
 });
 
+// Buyer "I paid" claim after a PayPal payment-link purchase (v1 manual flow,
+// 2026-09-27). Requires sign-in; records a pending payment keyed on the
+// PayPal transaction id so the manual grant (POST /api/admin/grant-credits
+// with matching pendingId) can resolve it. Dedupes: the same (email, txnId)
+// already open -> duped:true, so a double-tap or retry grants nothing twice.
+app.post("/api/pending-claim", (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return res.status(401).json({ error: "Sign in to file a payment claim." });
+  const txnId = String((req.body && req.body.txnId) || "").trim();
+  if (!/^[a-zA-Z0-9-]{6,64}$/.test(txnId))
+    return res.status(400).json({ error: "Paste the PayPal transaction ID from your receipt." });
+  const list = loadPendingPayments();
+  const existing = list.find((p) => !p.resolved && p.type === "i-paid" && p.txnId === txnId && p.payerEmail === user.email);
+  if (existing) return res.json({ ok: true, duped: true, claimId: existing.id });
+  const entry = {
+    id: crypto.randomBytes(8).toString("hex"),
+    ts: new Date().toISOString(),
+    type: "i-paid",
+    reason: "buyer tap",
+    amount: 12.99,
+    currency: "USD",
+    payerEmail: user.email,
+    txnId,
+    customId: "",
+    eventId: "",
+    resolved: false,
+  };
+  list.push(entry);
+  try {
+    fs.writeFileSync(PENDING_PAYMENTS_PATH, JSON.stringify(list.slice(-200), null, 2));
+  } catch {}
+  res.json({ ok: true, claimId: entry.id });
+});
+
 // ---- PayPal webhook: fully automatic payment processing ----
 // Cody takes $12.99 via PayPal payment links. This endpoint lets PayPal call
 // home the moment money lands, so Cody drops out of the loop entirely:
@@ -2202,7 +2236,17 @@ function beaconNotify(from, text) {
 app.post("/api/webhooks/paypal", express.raw({ type: "application/json", limit: "1mb" }), async (req, res) => {
   if (!paymentsLive())
     return res.status(503).json({ error: "PayPal webhook not configured (set PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET, PAYPAL_WEBHOOK_ID)." });
-  const rawBody = req.body ? req.body.toString("utf8") : "";
+  // Nova 2026-09-27: the global express.json() (line 68) already parses this
+  // body before the route-level express.raw() runs (body-parser skips when
+  // req._body is set), so req.body is an OBJECT here and .toString() yields
+  // "[object Object]" — JSON.parse then throws and EVERY legitimate webhook
+  // 401s "Invalid signature", so no payment would ever grant credits.
+  // Re-serialize the parsed body; PayPal's verify API takes webhook_event as
+  // an object anyway, so verification semantics are preserved.
+  let rawBody = "";
+  if (Buffer.isBuffer(req.body)) rawBody = req.body.toString("utf8");
+  else if (typeof req.body === "string") rawBody = req.body;
+  else if (req.body && typeof req.body === "object") rawBody = JSON.stringify(req.body);
   if (!rawBody) return res.status(400).json({ error: "Empty body." });
   if (!(await verifyPaypalWebhook(req, rawBody))) {
     console.warn("[paypal] webhook signature verification FAILED — ignored.");
