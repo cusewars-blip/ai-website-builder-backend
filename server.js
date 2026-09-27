@@ -2138,6 +2138,85 @@ app.post("/api/pending-claim", (req, res) => {
   res.json({ ok: true, claimId: entry.id });
 });
 
+// ---- Standalone checkout page (GET /pay) ----
+// Workaround checkout: the Muse app share/publish is gated on Cody's app
+// credits, so buyers get a live payment page straight from the backend.
+// Same three-step manual flow as the in-app checkout:
+//   1. Sign in (email+password)  2. Pay $12.99 via PayPal link
+//   3. Paste the PayPal transaction ID -> POST /api/pending-claim
+// Cody verifies each claim and grants 100 credits manually (runbook in
+// hidden_files/paypal-manual-grant-one-pager.md).
+app.get("/pay", (req, res) => {
+  res.type("html").send(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Website Builder — Get 100 credits</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0a0a0b;color:#f5f5f5;font-family:-apple-system,system-ui,Segoe UI,Roboto,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.card{width:100%;max-width:420px;background:#141416;border:1px solid #232326;border-radius:16px;padding:28px}
+h1{font-size:22px;margin-bottom:4px}h1 .red{color:#ff2d2d}
+.sub{color:#9a9aa0;font-size:14px;margin-bottom:22px}
+.step{display:none}.step.on{display:block}
+label{display:block;font-size:13px;color:#bdbdc2;margin:12px 0 6px}
+input{width:100%;padding:12px;border-radius:10px;border:1px solid #2c2c31;background:#0e0e10;color:#fff;font-size:15px}
+.btn{display:block;width:100%;padding:14px;border:none;border-radius:12px;font-size:16px;font-weight:700;cursor:pointer;margin-top:16px;text-align:center;text-decoration:none}
+.btn-red{background:#ff2d2d;color:#fff}.btn-red:active{transform:scale(.98)}
+.btn-ghost{background:#1c1c20;color:#f5f5f5;border:1px solid #333}
+.hint{font-size:13px;color:#9a9aa0;margin-top:12px;line-height:1.5}
+.err{color:#ff7a7a;font-size:13px;margin-top:10px;min-height:18px}
+.ok{color:#3ddc84;font-size:14px;margin-top:12px;line-height:1.5}
+.tabs{display:flex;gap:8px;margin-bottom:6px}
+.tabs button{flex:1;padding:10px;border-radius:10px;border:1px solid #333;background:#1c1c20;color:#ccc;cursor:pointer}
+.tabs button.on{background:#ff2d2d;border-color:#ff2d2d;color:#fff;font-weight:700}
+.price{font-size:15px;color:#d8d8dc;margin:6px 0 2px}
+.txn-note{background:#17181c;border:1px solid #2a2b31;border-radius:10px;padding:12px;font-size:13px;color:#bdbdc2;margin-top:14px;line-height:1.5}
+.back{display:block;text-align:center;margin-top:18px;font-size:13px;color:#7a7a80;text-decoration:none}
+</style></head><body>
+<div class="card">
+<h1>AI Website Builder <span class="red">— 100 credits</span></h1>
+<p class="sub">One-time <b style="color:#fff">$12.99</b> &middot; 100 credits &middot; every 3rd purchase earns a 150-credit bonus</p>
+
+<div id="s-auth" class="step on">
+  <div class="tabs"><button id="tab-login" class="on">Sign in</button><button id="tab-signup">Create account</button></div>
+  <label>Email</label><input id="email" type="email" autocomplete="email" placeholder="you@example.com">
+  <label>Password</label><input id="pw" type="password" autocomplete="current-password" placeholder="••••••••">
+  <div class="err" id="auth-err"></div>
+  <button class="btn btn-red" id="auth-go">Continue</button>
+  <p class="hint">You need an account so your credits land in the right place.</p>
+</div>
+
+<div id="s-pay" class="step">
+  <p class="price">Step 2 — pay <b>$12.99</b> securely with PayPal:</p>
+  <a class="btn btn-red" href="https://paypal.me/CodyBeaulieu921/12.99" target="_blank" rel="noopener">Pay $12.99 with PayPal</a>
+  <div class="txn-note">After paying, keep your receipt open — you'll need the <b>transaction ID</b> (PayPal emails it to you too). Pay the exact $12.99 so your claim matches.</div>
+  <button class="btn btn-ghost" id="to-claim">I've paid — continue</button>
+</div>
+
+<div id="s-claim" class="step">
+  <p class="price">Step 3 — paste your PayPal transaction ID:</p>
+  <label>Transaction ID</label><input id="txn" placeholder="e.g. 5RX12345AB678901C">
+  <div class="err" id="claim-err"></div>
+  <button class="btn btn-red" id="claim-go">Submit — I paid</button>
+  <div class="ok" id="claim-ok"></div>
+  <p class="hint">Credits are added once the payment is verified — usually the same day. You'll be notified in the builder.</p>
+</div>
+
+<a class="back" href="/">← Back to the builder</a>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+let mode='login';
+$('tab-login').onclick=()=>{mode='login';$('tab-login').classList.add('on');$('tab-signup').classList.remove('on');$('auth-go').textContent='Continue';};
+$('tab-signup').onclick=()=>{mode='signup';$('tab-signup').classList.add('on');$('tab-login').classList.remove('on');$('auth-go').textContent='Create account';};
+function show(id){document.querySelectorAll('.step').forEach(s=>s.classList.remove('on'));$(id).classList.add('on');}
+async function api(path,body){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify(body)});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||'Something went wrong');return j;}
+$('auth-go').onclick=async()=>{try{$('auth-err').textContent='';await api('/api/auth/'+mode,{email:$('email').value.trim(),password:$('pw').value});show('s-pay');}catch(e){$('auth-err').textContent=e.message;}};
+$('to-claim').onclick=()=>show('s-claim');
+$('claim-go').onclick=async()=>{try{$('claim-err').textContent='';$('claim-ok').textContent='';const j=await api('/api/pending-claim',{txnId:$('txn').value.trim()});$('claim-ok').textContent=j.duped?'Already received — your claim is on file and will be verified.':'Claim received! Your 100 credits will be added once the payment is verified.';$('txn').value='';}catch(e){$('claim-err').textContent=e.message;}};
+fetch('/api/me',{credentials:'same-origin'}).then(r=>r.json()).then(j=>{if(j&&j.email)show('s-pay');}).catch(()=>{});
+</script></body></html>`);
+});
+
 // ---- PayPal webhook: fully automatic payment processing ----
 // Cody takes $12.99 via PayPal payment links. This endpoint lets PayPal call
 // home the moment money lands, so Cody drops out of the loop entirely:
