@@ -236,8 +236,47 @@ function loadLedger() {
   }
 }
 
+const LEDGER_TMP_PATH = LEDGER_PATH + ".tmp";
+// Torn-write guard (same class as saveDedupeMarkers): loadLedger() treats an
+// unparseable credits.json as {} — every balance silently zeroes. A plain
+// writeFileSync that dies mid-write leaves partial JSON, and the next load
+// would "forget" all paid credits. rename is atomic on the same filesystem,
+// so LEDGER_PATH is always a complete file or the previous complete file.
 function saveLedger(ledger) {
-  fs.writeFileSync(LEDGER_PATH, JSON.stringify(ledger, null, 2));
+  fs.writeFileSync(LEDGER_TMP_PATH, JSON.stringify(ledger, null, 2));
+  fs.renameSync(LEDGER_TMP_PATH, LEDGER_PATH);
+}
+
+// ---- in-payload claim stamps (Nova 2026-09-27) ----
+// A stamp that lives in a second file (or a second write to the same file)
+// is a second write away from being a lie: crash or swallowed error between
+// the balance write and the stamp write refunds unstamped, and the retry
+// double-refunds. The stamp therefore rides INSIDE the payload that carries
+// the balance — ledger.__claimedStamps for anonymous users, u.claimedStamps
+// for accounts — written by the same atomic temp+rename as the money. One
+// file, one write; money and stamp can never diverge. Credit-history rows
+// and dedupe.json markers remain as witnesses/audit only — never guard
+// authority.
+const CLAIM_STAMP_TTL_MS = 24 * 60 * 60 * 1000;
+const CLAIM_STAMP_PRUNE_AT = 500;
+function stampClaim(set, stamp) {
+  if (!stamp) return set;
+  if (!set || typeof set !== "object" || Array.isArray(set)) set = {};
+  set[stamp] = Date.now();
+  const keys = Object.keys(set);
+  if (keys.length > CLAIM_STAMP_PRUNE_AT) {
+    const cutoff = Date.now() - CLAIM_STAMP_TTL_MS;
+    for (const k of keys) if (typeof set[k] !== "number" || set[k] < cutoff) delete set[k];
+  }
+  return set;
+}
+function hasClaim(set, stamp) {
+  return (
+    !!set &&
+    typeof set === "object" &&
+    typeof set[stamp] === "number" &&
+    set[stamp] > Date.now() - CLAIM_STAMP_TTL_MS
+  );
 }
 
 // Unmatched / manual-review PayPal events live here so they survive until a
@@ -296,13 +335,16 @@ function resolvePendingPayment(id, resolvedBy) {
 }
 
 function validUserId(id) {
-  return typeof id === "string" && id.length >= 8 && id.length <= 64 && /^[a-zA-Z0-9-_]+$/.test(id);
+  // "__"-prefixed ids are reserved for in-payload claim-stamp keys — a
+  // client-minted ledgerKey must never collide with ledger.__claimedStamps.
+  return typeof id === "string" && id.length >= 8 && id.length <= 64 && /^[a-zA-Z0-9-_]+$/.test(id) && !id.startsWith("__");
 }
 
 // ---- credit transaction history (live feed) ----
 // Per-user log of every credit movement, capped at 50 entries each.
 // NOTE: ephemeral JSON on Render free tier — move to a database before production.
 const CREDIT_HISTORY_PATH = path.join(__dirname, "credit-history.json");
+const CREDIT_HISTORY_TMP_PATH = CREDIT_HISTORY_PATH + ".tmp";
 const LOW_BALANCE_THRESHOLD = parseFloat(process.env.LOW_BALANCE_THRESHOLD || "2");
 
 function loadCreditHistory() {
@@ -313,20 +355,168 @@ function loadCreditHistory() {
   }
 }
 
+// Atomic write: a torn credit-history.json loses the audit trail that
+// backs every dispute; rename keeps the file complete-or-previous.
 function saveCreditHistory(h) {
-  fs.writeFileSync(CREDIT_HISTORY_PATH, JSON.stringify(h, null, 2));
+  fs.writeFileSync(CREDIT_HISTORY_TMP_PATH, JSON.stringify(h, null, 2));
+  fs.renameSync(CREDIT_HISTORY_TMP_PATH, CREDIT_HISTORY_PATH);
 }
 
-function logCreditTx(userKey, delta, reason, balance) {
+function logCreditTx(userKey, delta, reason, balance, idemKey) {
   try {
     const h = loadCreditHistory();
     const list = h[userKey] || [];
-    list.unshift({ ts: Date.now(), delta, reason, balance });
+    // Nova: optional idem key stamped on charge rows (publish/renew attempt
+    // keys). Pure metadata for the Neon cutover — the feed only renders
+    // ts/delta/reason/balance, so the cap-50 display semantics are untouched.
+    const row = { ts: Date.now(), delta, reason, balance };
+    if (idemKey) row.idem = idemKey;
+    list.unshift(row);
     h[userKey] = list.slice(0, 50);
     saveCreditHistory(h);
   } catch (e) {
     console.log("credit history log failed:", e.message);
+    // Swallowed deliberately (a 500 on money paths would be worse), but never
+    // silently: the sweep reports this counter once per cycle. In-memory, so
+    // it reads "since boot" — enough for an audit gap.
+    beaconStats.witnessFails++;
   }
+}
+
+// ---- idempotency markers (publish/renew replay guard) ----
+// Markers live in their own dedupe.json map keyed by the dedupe triple — NOT
+// in the credit history feed. A replay guard that scans a capped display feed
+// inherits the cap as its retry window, and exempting rows would break the
+// feed's "recent 50" semantics. Each marker carries its own expiry (the window
+// it protects, e.g. the 30-day live window); stale markers are pruned lazily
+// on read, so a marker can never outlive the intent it protects — even a crash
+// can't leave a guard blocking a legit re-publish.
+const DEDUPE_PATH = path.join(__dirname, "dedupe.json");
+const DEDUPE_TMP_PATH = DEDUPE_PATH + ".tmp";
+
+// Atomic write for dedupe markers: temp+rename so a crash can never leave
+// dedupe.json torn. A plain writeFileSync that dies mid-write leaves partial
+// JSON, and loadDedupeMarkers treats an unparseable file as empty — every
+// idempotency marker silently lost, reopening the double-charge window.
+// rename is atomic on the same filesystem, so DEDUPE_PATH is always a
+// complete snapshot; a leftover .tmp is just ignored.
+function saveDedupeMarkers(m) {
+  fs.writeFileSync(DEDUPE_TMP_PATH, JSON.stringify(m, null, 2));
+  fs.renameSync(DEDUPE_TMP_PATH, DEDUPE_PATH);
+}
+
+function loadDedupeMarkers() {
+  try {
+    const m = JSON.parse(fs.readFileSync(DEDUPE_PATH, "utf8"));
+    const now = Date.now();
+    let pruned = false;
+    for (const k of Object.keys(m)) {
+      if (!m[k] || m[k].expiresAt <= now) { delete m[k]; pruned = true; }
+    }
+    if (pruned) { try { saveDedupeMarkers(m); } catch {} }
+    return m;
+  } catch {
+    return {};
+  }
+}
+
+// Returns the live marker for this dedupe key, or null. Expired markers are
+// pruned on read, so a stale marker never blocks a new intent. Also consults
+// pendingMarkers (see setDedupeMarker) so a marker that failed to persist
+// still guards in-process retries.
+function checkDedupe(dedupeKey) {
+  flushPendingMarkers();
+  const now = Date.now();
+  const pending = pendingMarkers.find((p) => p.key === dedupeKey);
+  if (pending && pending.marker.expiresAt > now) return pending.marker;
+  const m = loadDedupeMarkers();
+  return m[dedupeKey] || null;
+}
+
+// Writes (or refreshes) an idempotency marker. Called by charge-with-intent
+// routes AFTER their side effect completes (site written, expiry extended),
+// so a replay always returns a result for work that actually happened — a
+// marker never precedes its outcome.
+//
+// Nova's catch: the old version swallowed a failed marker write behind a
+// console.log, turning a disk hiccup into a silent lost guard (charge landed,
+// no marker, retry double-charges). So this retries the write, and anything
+// still unwritten lands in pendingMarkers: checkDedupe consults that list
+// too, so in-process retries still dedupe while the write is pending, and
+// every marker op retries the flush. A crash in the gap is still a lost
+// marker — true atomicity needs the Neon migration; this bounds the hole to
+// the crash window.
+const PENDING_MARKERS_MAX = 200;
+const pendingMarkers = [];
+
+function flushPendingMarkers() {
+  const now = Date.now();
+  for (let i = pendingMarkers.length - 1; i >= 0; i--) {
+    // Expired pendings can never guard again — prune the corpse before the
+    // cap check, so dead entries don't crowd out live ones.
+    if (pendingMarkers[i].marker.expiresAt <= now) {
+      pendingMarkers.splice(i, 1);
+      continue;
+    }
+    try {
+      const m = loadDedupeMarkers();
+      m[pendingMarkers[i].key] = pendingMarkers[i].marker;
+      saveDedupeMarkers(m);
+      pendingMarkers.splice(i, 1);
+    } catch {}
+  }
+}
+
+function setDedupeMarker(dedupeKey, meta, ttlMs) {
+  if (!dedupeKey) return;
+  flushPendingMarkers();
+  const marker = Object.assign(
+    { ts: Date.now(), expiresAt: Date.now() + (ttlMs || 24 * 60 * 60 * 1000) },
+    meta || {}
+  );
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const m = loadDedupeMarkers();
+      m[dedupeKey] = marker;
+      saveDedupeMarkers(m);
+      return;
+    } catch (e) {
+      if (attempt === 2) {
+        console.error("dedupe marker write FAILED after retries:", e.message);
+        if (pendingMarkers.length >= PENDING_MARKERS_MAX) pendingMarkers.shift();
+        pendingMarkers.push({ key: dedupeKey, marker });
+      }
+    }
+  }
+}
+
+// Clears an idempotency marker (e.g. a pending claim on a charge that never
+// landed), so the same attemptId can start clean. Best-effort: on failure the
+// marker's TTL expires it on its own.
+function clearDedupeMarker(dedupeKey) {
+  if (!dedupeKey) return;
+  try {
+    const m = loadDedupeMarkers();
+    if (m[dedupeKey]) {
+      delete m[dedupeKey];
+      saveDedupeMarkers(m);
+    }
+  } catch {}
+  for (let i = pendingMarkers.length - 1; i >= 0; i--) {
+    if (pendingMarkers[i].key === dedupeKey) pendingMarkers.splice(i, 1);
+  }
+}
+
+// Single choke point for charging an identity (account or legacy userId).
+// Publish and upkeep renewal always draw real credits — never spin credits —
+// so allowSpin stays false for them. Returns { remaining, spinUsed }, or
+// null when the user can't afford it.
+function chargeIdentity(identity, amount, reason, allowSpin, idemKey) {
+  const res = identity.user
+    ? acctSpend(identity.user.id, amount, reason, allowSpin, idemKey)
+    : { remaining: spend(identity.ledgerKey, amount, reason, idemKey), spinUsed: 0 };
+  if (!res || res.remaining === null || res.remaining === undefined) return null;
+  return res;
 }
 
 // New users automatically start with FREE_CREDITS free credits.
@@ -341,27 +531,34 @@ function getBalance(userId) {
 }
 
 // Returns the new balance, or null when the user can't afford it.
-function spend(userId, amount, reason) {
+function spend(userId, amount, reason, idemKey) {
   const ledger = loadLedger();
   const balance = userId in ledger ? ledger[userId] : FREE_CREDITS;
   if (balance < amount) return null;
   ledger[userId] = balance - amount;
   saveLedger(ledger);
-  logCreditTx("ledger:" + userId, -amount, reason || "build", ledger[userId]);
+  logCreditTx("ledger:" + userId, -amount, reason || "build", ledger[userId], idemKey);
   return ledger[userId];
 }
 
-function refund(userId, amount, reason) {
+function refund(userId, amount, reason, idemKey) {
   const ledger = loadLedger();
   ledger[userId] = (userId in ledger ? ledger[userId] : FREE_CREDITS) + amount;
+  // Nova in-payload collapse 2026-09-27: the stamp rides the same atomic
+  // temp+rename as the balance — one write, no between-the-writes tear.
+  // (The old comment claiming the history row made this "one write" was
+  // wrong: saveLedger + logCreditTx were always two writes, and logCreditTx
+  // swallows its own errors, so the stamp could die with no crash at all.)
+  if (idemKey) ledger.__claimedStamps = stampClaim(ledger.__claimedStamps, idemKey);
   saveLedger(ledger);
-  logCreditTx("ledger:" + userId, amount, reason || "refund", ledger[userId]);
+  logCreditTx("ledger:" + userId, amount, reason || "refund", ledger[userId], idemKey); // witness only
 }
 
 // ---- purchase tracking (promo: every 3rd 100-credit purchase earns 150 bonus) ----
 // In production, call recordPurchase() from your Stripe/PayPal webhook
 // when a 100-credit pack payment succeeds.
 const PURCHASES_PATH = path.join(__dirname, "purchases.json");
+const PURCHASES_TMP_PATH = PURCHASES_PATH + ".tmp";
 
 function loadPurchases() {
   try {
@@ -371,22 +568,34 @@ function loadPurchases() {
   }
 }
 
+// Atomic write: a torn purchases.json forgets who paid. rename keeps it
+// complete-or-previous so paid credits can't vanish mid-write.
 function savePurchases(p) {
-  fs.writeFileSync(PURCHASES_PATH, JSON.stringify(p, null, 2));
+  fs.writeFileSync(PURCHASES_TMP_PATH, JSON.stringify(p, null, 2));
+  fs.renameSync(PURCHASES_TMP_PATH, PURCHASES_PATH);
 }
 
 // Grants 100 credits per purchase, plus a 150-credit bonus on every 3rd purchase.
-function recordPurchase(userId) {
+// Nova idempotent grant 2026-09-27: the anon grant path was naked — a client
+// retry after a network blip double-granted 100 credits. The key rides the
+// same saveLedger write as the balance (one write, zero intermediate
+// states); a retry no-ops as duped instead of double-granting. TTL-agnostic
+// on purpose: PayPal retries span days, so a grant key must never age out.
+function recordPurchase(userId, idemKey) {
+  const ledger = loadLedger();
+  if (idemKey && ledger.__claimedStamps && typeof ledger.__claimedStamps[idemKey] === "number") {
+    return { purchaseCount: null, creditsAdded: 0, bonus: 0, credits: (userId in ledger ? ledger[userId] : FREE_CREDITS), duped: true };
+  }
   const purchases = loadPurchases();
   const count = (purchases[userId] || 0) + 1;
   purchases[userId] = count;
   savePurchases(purchases);
 
   const bonus = count % 3 === 0 ? 150 : 0;
-  const ledger = loadLedger();
   ledger[userId] = (userId in ledger ? ledger[userId] : FREE_CREDITS) + 100 + bonus;
+  if (idemKey) ledger.__claimedStamps = stampClaim(ledger.__claimedStamps, idemKey);
   saveLedger(ledger);
-  logCreditTx("ledger:" + userId, 100 + bonus, bonus ? "credit purchase + bonus" : "credit purchase", ledger[userId]);
+  logCreditTx("ledger:" + userId, 100 + bonus, bonus ? "credit purchase + bonus" : "credit purchase", ledger[userId], idemKey);
   return { purchaseCount: count, creditsAdded: 100 + bonus, bonus };
 }
 
@@ -399,6 +608,8 @@ function recordPurchase(userId) {
 // restart/redeploy). Fine for testing; use a real database before launch.
 const USERS_PATH = path.join(__dirname, "users.json");
 const SESSIONS_PATH = path.join(__dirname, "sessions.json");
+const USERS_TMP_PATH = USERS_PATH + ".tmp";
+const SESSIONS_TMP_PATH = SESSIONS_PATH + ".tmp";
 const SESSION_COOKIE = "wb_session";
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
@@ -433,8 +644,11 @@ function loadUsers() {
   }
 }
 
+// Atomic write: users.json is the worst torn-write in the tree — it zeroes
+// every account. rename keeps it complete-or-previous.
 function saveUsers(users) {
-  fs.writeFileSync(USERS_PATH, JSON.stringify(users, null, 2));
+  fs.writeFileSync(USERS_TMP_PATH, JSON.stringify(users, null, 2));
+  fs.renameSync(USERS_TMP_PATH, USERS_PATH);
 }
 
 function loadSessions() {
@@ -445,8 +659,11 @@ function loadSessions() {
   }
 }
 
+// Atomic write: a torn sessions.json logs out every user. rename keeps it
+// complete-or-previous.
 function saveSessions(sessions) {
-  fs.writeFileSync(SESSIONS_PATH, JSON.stringify(sessions, null, 2));
+  fs.writeFileSync(SESSIONS_TMP_PATH, JSON.stringify(sessions, null, 2));
+  fs.renameSync(SESSIONS_TMP_PATH, SESSIONS_PATH);
 }
 
 function findUserByEmail(email) {
@@ -580,7 +797,7 @@ function acctBalance(userId) {
   return u ? u.credits : 0;
 }
 
-function acctSpend(userId, amount, reason, allowSpin) {
+function acctSpend(userId, amount, reason, allowSpin, idemKey) {
   const users = loadUsers();
   const u = users[userId];
   if (!u) return null;
@@ -596,12 +813,13 @@ function acctSpend(userId, amount, reason, allowSpin) {
     "acct:" + userId,
     -amount,
     (reason || "build") + (spinUsed > 0 ? ` (${spinUsed} from spin credits)` : ""),
-    u.credits
+    u.credits,
+    idemKey
   );
   return { remaining: u.credits, spinUsed };
 }
 
-function acctRefund(userId, amount, reason, spinAmount) {
+function acctRefund(userId, amount, reason, spinAmount, idemKey) {
   const users = loadUsers();
   const u = users[userId];
   if (!u) return;
@@ -610,19 +828,35 @@ function acctRefund(userId, amount, reason, spinAmount) {
   const spinBack = Math.min(spinAmount || 0, amount);
   if (spinBack > 0) u.spinCredits = (u.spinCredits || 0) + spinBack;
   u.credits += amount - spinBack;
+  // Nova in-payload collapse 2026-09-27: the stamp rides the same atomic
+  // temp+rename as the balance — one write, no between-the-writes tear.
+  // (acctRefund had the same two-write shape as refund: saveUsers, then a
+  // logCreditTx that swallows its own errors.)
+  if (idemKey) u.claimedStamps = stampClaim(u.claimedStamps, idemKey);
   saveUsers(users);
-  logCreditTx("acct:" + userId, amount, reason || "refund", u.credits);
+  logCreditTx("acct:" + userId, amount, reason || "refund", u.credits, idemKey); // witness only
 }
 
-function acctRecordPurchase(userId) {
+function acctRecordPurchase(userId, idemKey) {
   const users = loadUsers();
   const u = users[userId];
   if (!u) return null;
+  // Nova atomic unit 2026-09-27: idempotent grant keyed on the provider's own
+  // id ("paypal:"+captureId) or the caller's own key. The stamp rides the same
+  // atomic temp+rename write as the balance — one write — so mark-before-
+  // handle can't drop the grant on a crash, and a retry no-ops instead of
+  // double-granting. Grant stamps are TTL-agnostic on purpose: PayPal retries
+  // span days, so a grant key must never age out. Dedupe authority is this
+  // stamp; the seen-set file guards notification paths only.
+  if (idemKey && u.claimedStamps && typeof u.claimedStamps[idemKey] === "number") {
+    return { purchaseCount: u.purchases, creditsAdded: 0, bonus: 0, credits: u.credits, duped: true };
+  }
   u.purchases = (u.purchases || 0) + 1;
   const bonus = u.purchases % 3 === 0 ? 150 : 0;
   u.credits += 100 + bonus;
+  if (idemKey) u.claimedStamps = stampClaim(u.claimedStamps, idemKey);
   saveUsers(users);
-  logCreditTx("acct:" + userId, 100 + bonus, bonus ? "credit purchase + bonus" : "credit purchase", u.credits);
+  logCreditTx("acct:" + userId, 100 + bonus, bonus ? "credit purchase + bonus" : "credit purchase", u.credits, idemKey);
   return { purchaseCount: u.purchases, creditsAdded: 100 + bonus, bonus, credits: u.credits };
 }
 
@@ -1026,6 +1260,7 @@ const beaconStats = {
   lastSweepAt: 0, lastSweepMs: 0, lastError: null,
   sitesChecked: 0, imagesHealed: 0, linksNeutralized: 0,
   linkWarnings: 0, creditWarnings: 0,
+  witnessFails: 0, // logCreditTx swallowed witness-write failures since boot (audit gap, not a money leak)
 };
 let beaconSweepRunning = false;
 
@@ -1121,6 +1356,7 @@ function beaconCheckCredits() {
   try {
     const ledger = loadLedger();
     for (const [k, v] of Object.entries(ledger || {})) {
+      if (k.startsWith("__")) continue; // reserved: in-payload claim-stamp set, not a balance
       if (badNum(v) || v < 0) {
         beaconSay(`CREDIT WARN: legacy ledger "${k}" has invalid balance (${JSON.stringify(v)}).`);
         warnings++;
@@ -1262,6 +1498,7 @@ async function beaconSweep() {
     beaconStats.linksNeutralized += neutralized;
     beaconStats.linkWarnings += linkWarn;
     beaconSay(`sweep done: ${checked} sites checked, ${healed} images healed, ${neutralized} links neutralized in ${Date.now() - t0}ms.`);
+    if (beaconStats.witnessFails) beaconSay(`AUDIT: logCreditTx swallowed ${beaconStats.witnessFails} witness-write failure(s) since boot.`);
   } catch (e) {
     beaconStats.sweeps++;
     beaconStats.sweepsFailed++;
@@ -1325,6 +1562,16 @@ function startBeaconInside() {
       users: safe(USERS_PATH),
       sessions: safe(SESSIONS_PATH),
       ledger: safe(LEDGER_PATH),
+      // Beacon 2026-09-27: ledger write failure is a migration precondition —
+      // export script must refuse to write the .sql unless ledgerMeta.parseOk.
+      // Backward-compatible: ledger keeps its old shape, ledgerMeta is additive.
+      ledgerMeta: (() => {
+        try {
+          const raw = fs.readFileSync(LEDGER_PATH, "utf8");
+          try { JSON.parse(raw); return { exists: true, parseOk: true }; }
+          catch { return { exists: true, parseOk: false }; }
+        } catch { return { exists: false, parseOk: false }; }
+      })(),
       pendingPayments: pendingPaymentsSummary(),
       signupIpFlags: signupIpFlags(), // farm visibility: IPs with 3+ signups today
       signupIpFlags: signupIpFlags(), // graduated burn: >=3 signups/day/IP
@@ -1349,6 +1596,7 @@ app.get("/api/health", (req, res) => {
     upkeepDays: UPKEEP_DAYS,
     googleSignIn: googleConfigured(),
     auth: true,
+    paypalConfigured: paymentsLive(), // pipe armed: all 3 PayPal env vars set (Nova's armed-before-announce signal)
     deployedCommit: process.env.RENDER_GIT_COMMIT || "unknown",
     bootTime: BOOT_TIME,
   });
@@ -1789,12 +2037,21 @@ app.post("/api/purchase", (req, res) => {
   }
   const identity = resolveIdentity(req);
   if (!identity) return res.status(400).json({ error: "Valid userId required." });
+  // Nova idempotent grant 2026-09-27: this secret-gated route granted naked on
+  // every call, so a client retry after a network blip double-granted 100
+  // credits. One key per user action, frozen at tap time and reused across
+  // retries (Stripe-style) — it rides body `idemKey`, header `x-idem-key`, or
+  // query. Absent, the server mints one and returns it so the caller replays
+  // with it instead of tapping again.
+  const idemKey =
+    String((req.body && req.body.idemKey) || req.get("x-idem-key") || req.query.idemKey || "").trim() ||
+    "purchase:" + crypto.randomBytes(8).toString("hex");
   if (identity.user) {
-    const result = acctRecordPurchase(identity.user.id);
-    res.json({ ok: true, ...result });
+    const result = acctRecordPurchase(identity.user.id, idemKey);
+    res.json({ ok: true, idemKey, ...result });
   } else {
-    const result = recordPurchase(identity.ledgerKey);
-    res.json({ ok: true, credits: getBalance(identity.ledgerKey), ...result });
+    const result = recordPurchase(identity.ledgerKey, idemKey);
+    res.json({ ok: true, idemKey, credits: getBalance(identity.ledgerKey), ...result });
   }
 });
 
@@ -1820,10 +2077,31 @@ app.post("/api/admin/grant-credits", (req, res) => {
     return res.status(403).json({ error: "Invalid secret." });
   const user = validEmail(email) ? findUserByEmail(email) : null;
   if (!user) return res.status(404).json({ error: "No account with that email." });
-  const result = acctRecordPurchase(user.id);
-  if (typeof pendingId === "string" && pendingId)
+  // Tap-race guard: the pendingId must be a real entry minted by an "I paid"
+  // tap (validity gate — random ids 409 without granting). Grant-first: the
+  // idempotent grant ("manual:"+pendingId) is the dedupe authority, so a
+  // crash between grant and resolve heals on retry instead of 409ing with
+  // zero credits (the hole claim-first ordering left). Single-threaded sync
+  // read-modify-write makes the grant atomic on one Node process.
+  // Post-wipe replays mint fresh ids — that threat needs a durable txn-id key, staged next.
+  if (typeof pendingId === "string" && pendingId) {
+    const pendingExists = loadPendingPayments().some((p) => p.id === pendingId);
+    if (!pendingExists) return res.status(409).json({ error: "Unknown claim." });
+    const grantResult = acctRecordPurchase(user.id, "manual:" + pendingId);
     resolvePendingPayment(pendingId, `grant-credits:${user.email}`);
-  res.json({ ok: true, email: user.email, ...result });
+    if (grantResult.duped) return res.json({ ok: true, email: user.email, duped: true, credits: grantResult.credits });
+    return res.json({ ok: true, email: user.email, ...grantResult });
+  }
+  // Nova idempotent grant 2026-09-27: the no-pendingId fallback granted naked —
+  // tap, network blip, tap again = 200 credits, zero dedupe, and this is the
+  // route Cody himself drives from the tab (the live-fire double-grant with
+  // Cody's finger on it). Same shape as /api/purchase: one key per grant
+  // action, client-supplied or minted here, stamped in the grant's write.
+  const idemKey =
+    String((req.body && req.body.idemKey) || req.get("x-idem-key") || req.query.idemKey || "").trim() ||
+    "manual:" + crypto.randomBytes(8).toString("hex");
+  const result = acctRecordPurchase(user.id, idemKey);
+  res.json({ ok: true, email: user.email, idemKey, ...result });
 });
 
 // ---- PayPal webhook: fully automatic payment processing ----
@@ -1896,6 +2174,7 @@ async function verifyPaypalWebhook(req, rawBody) {
   } catch { return false; }
 }
 const PAYPAL_EVENTS_PATH = path.join(__dirname, "paypal-events.json");
+const PAYPAL_EVENTS_TMP_PATH = PAYPAL_EVENTS_PATH + ".tmp";
 function loadPaypalEvents() {
   try { const e = JSON.parse(fs.readFileSync(PAYPAL_EVENTS_PATH, "utf8")); return Array.isArray(e) ? e : []; }
   catch { return []; }
@@ -1904,7 +2183,7 @@ function paypalEventSeen(id) {
   const seen = loadPaypalEvents();
   if (seen.includes(id)) return true;
   seen.push(id);
-  try { fs.writeFileSync(PAYPAL_EVENTS_PATH, JSON.stringify(seen.slice(-500))); } catch {}
+  try { fs.writeFileSync(PAYPAL_EVENTS_TMP_PATH, JSON.stringify(seen.slice(-500))); fs.renameSync(PAYPAL_EVENTS_TMP_PATH, PAYPAL_EVENTS_PATH); } catch {}
   return false;
 }
 const CREDIT_PACK_PRICE = 12.99, CREDIT_PACK_CREDITS = 100;
@@ -1931,17 +2210,12 @@ app.post("/api/webhooks/paypal", express.raw({ type: "application/json", limit: 
   }
   let event;
   try { event = JSON.parse(rawBody); } catch { return res.status(400).json({ error: "Bad JSON." }); }
-  if (paypalEventSeen(event.id)) return res.json({ ok: true, deduped: true });
   const res_ = event.resource || {};
   const type = event.event_type || "";
   console.log("[paypal] event:", type, "id:", event.id);
-  if (type === "PAYMENT.CAPTURE.REFUNDED" || type === "PAYMENT.CAPTURE.REVERSED") {
-    recordPendingPayment({ type, reason: "refund/chargeback", amount, currency, payerEmail, customId: String(res_.custom_id || ""), eventId: event.id });
-    beaconNotify("beacon", `⚠️ PayPal refund/chargeback on ${res_.id || "a payment"} — review the account manually before re-granting anything.`);
-    return res.json({ ok: true, noted: "refund" });
-  }
-  if (type !== "PAYMENT.CAPTURE.COMPLETED" && type !== "PAYMENT.SALE.COMPLETED")
-    return res.json({ ok: true, ignored: type });
+  // Attribution fields live above the refund branch — they used to be
+  // declared below it, so any refund event hit the TDZ and threw before
+  // notifying (2026-09-27).
   const amount = parseFloat((res_.amount && res_.amount.value) || "0");
   const currency = (res_.amount && res_.amount.currency_code) || "";
   const payerEmail = (
@@ -1949,7 +2223,20 @@ app.post("/api/webhooks/paypal", express.raw({ type: "application/json", limit: 
     (event.payer && event.payer.email_address) ||
     ""
   ).toLowerCase();
+  if (type === "PAYMENT.CAPTURE.REFUNDED" || type === "PAYMENT.CAPTURE.REVERSED") {
+    // Non-grant path only: the seen-set guards duplicate notifications here.
+    // Grants dedupe on the ledger stamp, never on this file — mark-before-
+    // handle on the grant path is the phantom-dupe shape (crash between mark
+    // and grant, retry gets 200 deduped:true, user gets zero credits).
+    if (paypalEventSeen(event.id)) return res.json({ ok: true, deduped: true });
+    recordPendingPayment({ type, reason: "refund/chargeback", amount, currency, payerEmail, customId: String(res_.custom_id || ""), eventId: event.id });
+    beaconNotify("beacon", `⚠️ PayPal refund/chargeback on ${res_.id || "a payment"} — review the account manually before re-granting anything.`);
+    return res.json({ ok: true, noted: "refund" });
+  }
+  if (type !== "PAYMENT.CAPTURE.COMPLETED" && type !== "PAYMENT.SALE.COMPLETED")
+    return res.json({ ok: true, ignored: type });
   if (currency !== "USD" || amount < CREDIT_PACK_PRICE) {
+    if (paypalEventSeen(event.id)) return res.json({ ok: true, deduped: true });
     console.warn("[paypal] unexpected amount/currency:", amount, currency, "— held for manual review.");
     recordPendingPayment({ type, reason: "amount/currency-mismatch", amount, currency, payerEmail, customId: String(res_.custom_id || ""), eventId: event.id });
     beaconNotify("beacon", `⚠️ PayPal paid ${amount} ${currency} (expected $${CREDIT_PACK_PRICE}) from ${payerEmail || "unknown"} — held for manual review, no credits granted.`);
@@ -1962,31 +2249,182 @@ app.post("/api/webhooks/paypal", express.raw({ type: "application/json", limit: 
   let user = (customId && users[customId]) || null;
   if (!user && payerEmail && validEmail(payerEmail)) user = findUserByEmail(payerEmail);
   if (!user) {
+    if (paypalEventSeen(event.id)) return res.json({ ok: true, deduped: true });
     recordPendingPayment({ type, reason: "no-account", amount, currency, payerEmail, customId, eventId: event.id });
     beaconNotify("beacon", `💰 PayPal received $${amount.toFixed(2)} from ${payerEmail || "unknown email"} — but no builder account uses that email${customId ? " or custom_id " + customId : ""}. Match them manually and grant credits.`);
     return res.json({ ok: true, pending: "no-account" });
   }
-  const grant = acctRecordPurchase(user.id);
+  // Single atomic gate: the grant is keyed on the provider's own id, stamped
+  // into the same write as the balance. Key on the CAPTURE id (resource.id),
+  // not event.id — the same money can surface as COMPLETED and SALE.COMPLETED
+  // with different event ids; the capture id is the money's own identity.
+  // A retry no-ops here → 200 deduped:true (PayPal hammers non-2xx), never a
+  // double grant.
+  const captureId = String(res_.id || "").trim() || event.id;
+  const grant = acctRecordPurchase(user.id, "paypal:" + captureId);
+  if (grant.duped) return res.json({ ok: true, deduped: true });
   beaconNotify("beacon", `💰 Payment received! $${amount.toFixed(2)} via PayPal from ${payerEmail} — ${grant.creditsAdded} credits granted${grant.bonus ? " (includes 150 bonus!)" : ""}. Account: ${user.email}.`);
   res.json({ ok: true, email: user.email, ...grant });
 });
 
+// ---- publish crash recovery (Nova kill-test 2026-09-26) ----
+// A crash between charge and the result marker leaves the site on disk with
+// attemptId in meta.json but no dedupe marker. A crash between charge and the
+// site save leaves a stranded charge and no site. Both only surface after the
+// 2-min pending-claim TTL expires (marker pruned on read) — until then the
+// claim's 409 holds. This recovery runs ONLY on the no-marker path, never on
+// the hot dedupe path, so the claim-keyed fast path stays a map lookup.
+function findOrphanSite(ownerKey, attemptId) {
+  if (!attemptId || typeof attemptId !== "string") return null;
+  let dirs;
+  try { dirs = fs.readdirSync(SITES_DIR); } catch { return null; }
+  for (const d of dirs) {
+    try {
+      const meta = JSON.parse(fs.readFileSync(path.join(SITES_DIR, d, "meta.json"), "utf8"));
+      if (meta.owner === ownerKey && meta.attemptId === attemptId && meta.id) {
+        return { id: meta.id, name: meta.name, expiresAt: meta.expiresAt };
+      }
+    } catch {}
+  }
+  return null;
+}
+// Returns true when a stranded charge for this idemKey was reclaimed. The
+// #reclaim stamp rides inside the refund's own payload write (one atomic
+// temp+rename), so a repeat retry — or a crash mid-reclaim — can never
+// refund twice.
+function reclaimStrandedCharge(identity, idemKey) {
+  if (!idemKey) return false;
+  try {
+    // Beacon's catch 2026-09-27: anonymous charge rows are logged under
+    // "ledger:" + key by spend()/refund() — a bare ledgerKey bucket never
+    // finds them, so logged-out stranded charges were never reclaimed.
+    const ownerKey = identity.user ? "acct:" + identity.user.id : "ledger:" + identity.ledgerKey;
+    const h = loadCreditHistory();
+    const rows = h[ownerKey] || [];
+    const charged = rows.some((r) => r.idem === idemKey && r.delta === -40 && r.reason === "publish");
+    const stamp = idemKey + "#reclaim";
+    // Reclaim authority (Nova in-payload collapse 2026-09-27): the stamp
+    // rides the refund's own atomic write, so it is the one witness that
+    // cannot diverge from the money. The dedupe marker and the history row
+    // stay as audit witnesses only — a marker-only check would double-refund
+    // on a crash between refund() and setDedupeMarker(), and the row check
+    // fails in the tear logCreditTx's swallowed errors create. (The aging
+    // hole is narrower than it looks: the reclaim stamp is strictly newer
+    // than the charge in the same capped feed, so a stamp old enough to age
+    // out implies the charge row aged out too and `charged` above is
+    // already false. Belt and suspenders.)
+    const payloadStamps = identity.user
+      ? (loadUsers()[identity.user.id] || {}).claimedStamps
+      : (loadLedger().__claimedStamps || {});
+    const reclaimed =
+      hasClaim(payloadStamps, stamp) ||
+      !!checkDedupe(stamp) ||
+      rows.some((r) => r.idem === stamp);
+    if (!charged || reclaimed) return false;
+    // Nova in-payload collapse 2026-09-27: the #reclaim stamp is written
+    // inside refund()/acctRefund()'s own atomic payload write — a crash
+    // between the two old writes refunded twice, and the second write also
+    // doubled the feed (+80 shown for a +40 refund).
+    if (identity.user)
+      acctRefund(identity.user.id, PUBLISH_CREDITS, "publish-reclaim", 0, idemKey + "#reclaim");
+    else refund(identity.ledgerKey, PUBLISH_CREDITS, "publish-reclaim", idemKey + "#reclaim");
+    // Beacon guard pointer 2026-09-27: uncapped witness for the #reclaim stamp.
+    // The in-payload stamp covers the crash-inside-reclaim window now (same
+    // atomic write as the money); this marker covers 50-cap aging for late
+    // retries as audit. TTL = the attempt marker's own life — a replay past
+    // that is a new intent.
+    setDedupeMarker(stamp, { kind: "publish-reclaim", ownerKey }, PUBLISH_IDEM_TTL);
+    console.log("reclaimed stranded publish charge", idemKey);
+    return true;
+  } catch (e) {
+    console.log("reclaim failed:", e.message);
+    return false;
+  }
+}
+
 // Publish a generated site and get a public URL back.
 // Publishing costs credits — publishing is the premium moment worth paying for.
 const PUBLISH_CREDITS = 40;
+// Publish idempotency: the client mints one attemptId per Publish click and
+// sends it in the body; the server dedupes on (ownerKey, attemptId) and
+// returns the ORIGINAL site instead of charging twice. The marker is durable
+// (dedupe.json, survives naps/redeploys) and carries the publish result, so a
+// replay of the same attemptId always resolves to the same site.
+const PUBLISH_IDEM_TTL = 7 * 24 * 60 * 60 * 1000;
+// Pending-claim TTL: long enough to cover a slow publish (seconds), short
+// enough that a crashed claim never blocks a real retry for long.
+const PENDING_CLAIM_TTL_MS = 2 * 60 * 1000;
 app.post("/api/publish", (req, res) => {
   const identity = resolveIdentity(req);
   if (!identity) return res.status(401).json({ error: "Sign in to publish." });
-  const { html, title, projectId } = req.body || {};
+  const { html, title, projectId, attemptId } = req.body || {};
   if (!html || typeof html !== "string" || html.length < 100 || html.length > 500000) {
     return res.status(400).json({ error: "Valid generated HTML required." });
   }
+  const ownerKey = identity.user ? "acct:" + identity.user.id : identity.ledgerKey;
+  const idemKey =
+    typeof attemptId === "string" && attemptId ? "publish:" + ownerKey + ":" + attemptId : null;
+  if (idemKey) {
+    const prior = checkDedupe(idemKey);
+    if (prior && prior.result) {
+      // Done markers are site-tied, not wall-clocked: a done marker whose
+      // site row is gone must die with the site instead of handing back a
+      // URL to a dead site. Fall through WITHOUT clearing the marker — the
+      // orphan scan below re-stamps it if the site is actually still there
+      // (transient read miss), and the reclaim path refunds-then-recharges
+      // exactly once if the site is truly gone. Either way a replay is one
+      // publish: never a dead URL, never a double charge.
+      if (prior.result.id && siteMeta(prior.result.id))
+        return res.json({ ok: true, deduped: true, ...prior.result });
+    }
+    // Claim-before-charge (Beacon's rule, 23:44): the pending claim is stamped
+    // BEFORE the charge, so a crash between charge and the result marker can
+    // never double-charge. A replayed attemptId landing on a fresh claim gets
+    // a loud 409 instead of a second charge; a crashed claim expires in 2 min
+    // and the retry starts clean (charge never landed).
+    if (prior && prior.pendingClaim) {
+      return res.status(409).json({
+        error:
+          "This publish is already in progress. Wait a moment, then retry with the same attemptId — it will never be charged twice.",
+      });
+    }
+    // Crash recovery: the pending claim's TTL has expired (marker pruned on
+    // read), so this attemptId may belong to a crashed publish. Check the
+    // artifact before charging again — the debate ends at the artifact.
+    if (typeof attemptId === "string" && attemptId) {
+      const orphan = findOrphanSite(ownerKey, attemptId);
+      if (orphan) {
+        const bal = identity.user
+          ? ((loadUsers()[identity.user.id] || {}).credits ?? null)
+          : getBalance(identity.ledgerKey);
+        const recovered = {
+          ok: true,
+          deduped: true,
+          id: orphan.id,
+          name: orphan.name,
+          url: `/s/${orphan.id}/`,
+          domain: SITES_DOMAIN ? `https://${orphan.name}.${SITES_DOMAIN}` : null,
+          credits: bal,
+          expiresAt: orphan.expiresAt,
+          upkeepCredits: UPKEEP_CREDITS,
+          upkeepDays: UPKEEP_DAYS,
+        };
+        setDedupeMarker(idemKey, { result: recovered }, PUBLISH_IDEM_TTL);
+        return res.json(recovered);
+      }
+      // No site on disk: the crash happened before the save, so the charge
+      // is stranded. Reclaim it once, then proceed with a single fresh charge.
+      reclaimStrandedCharge(identity, idemKey);
+    }
+    setDedupeMarker(idemKey, { pendingClaim: true }, PENDING_CLAIM_TTL_MS);
+  }
   // Charge for publishing up front. Publish draws real credits only — never spin credits.
-  const spendRes = identity.user
-    ? acctSpend(identity.user.id, PUBLISH_CREDITS)
-    : { remaining: spend(identity.ledgerKey, PUBLISH_CREDITS), spinUsed: 0 };
-  const remaining = !spendRes ? null : spendRes.remaining;
+  const charged = chargeIdentity(identity, PUBLISH_CREDITS, "publish", false, idemKey);
+  const remaining = charged ? charged.remaining : null;
   if (remaining === null) {
+    // Charge never landed: clear the claim so the same attemptId retries clean
+    // after the user tops up credits.
+    clearDedupeMarker(idemKey);
     return res
       .status(402)
       .json({ error: `Your site is ready. Launch it live: publishing costs ${PUBLISH_CREDITS} credits — the 100-credit pack ($12.99) covers it plus your first 30 days live.` });
@@ -2015,6 +2453,7 @@ app.post("/api/publish", (req, res) => {
           title: typeof title === "string" ? title.slice(0, 120) : "Untitled",
           publishedAt: new Date().toISOString(),
           expiresAt: Date.now() + UPKEEP_MS,
+          attemptId: typeof attemptId === "string" ? attemptId : null,
         },
         null,
         2
@@ -2022,6 +2461,8 @@ app.post("/api/publish", (req, res) => {
     );
   } catch (e) {
     refundPublish();
+    // Charge was refunded: clear the claim so the retry starts clean.
+    clearDedupeMarker(idemKey);
     throw e;
   }
   // Link the published site back to its saved project, if provided.
@@ -2038,7 +2479,7 @@ app.post("/api/publish", (req, res) => {
       console.log("project link failed:", e.message);
     }
   }
-  res.json({
+  const publishResult = {
     ok: true,
     id,
     name,
@@ -2048,7 +2489,11 @@ app.post("/api/publish", (req, res) => {
     expiresAt: Date.now() + UPKEEP_MS,
     upkeepCredits: UPKEEP_CREDITS,
     upkeepDays: UPKEEP_DAYS,
-  });
+  };
+  // Stamp the durable marker only after the site exists on disk: a replay of
+  // this attemptId now returns the original site instead of charging again.
+  setDedupeMarker(idemKey, { result: publishResult }, PUBLISH_IDEM_TTL);
+  res.json(publishResult);
 });
 
 // List the caller's published sites with their upkeep status.
@@ -2081,6 +2526,61 @@ app.get("/api/sites", (req, res) => {
 });
 
 // Renew a published site for another 30 days. Costs upkeep credits.
+// Renew idempotency: the key must be stable across a retry, so it is keyed on
+
+// ---- renew crash recovery (Nova kill-test 2026-09-26, ported 1:1 from publish) ----
+// A crash between chargeIdentity and writeSiteMeta leaves a stranded 40 with
+// no dedupe marker and no meta.attemptId stamp. A same-attemptId retry then
+// charges AGAIN — spend()/acctSpend() log the idemKey but never dedupe on it.
+// This runs ONLY on the no-marker path, never on the hot dedupe path. The
+// stranded charge is reclaimed once (stamped row, so a repeat retry can never
+// refund twice), then the charge below lands exactly once. renew differs from
+// publish only in that there is no artifact to read back — the site id is in
+// the URL — so recovery = reclaim, no disk scan.
+function reclaimStrandedRenewCharge(identity, renewKey) {
+  if (!renewKey) return false;
+  try {
+    // Same anonymous-bucket fix as publish: charge rows live under
+    // "ledger:" + key, not the bare ledgerKey (Beacon 2026-09-27).
+    const ownerKey = identity.user ? "acct:" + identity.user.id : "ledger:" + identity.ledgerKey;
+    const h = loadCreditHistory();
+    const rows = h[ownerKey] || [];
+    const charged = rows.some(
+      (r) => r.idem === renewKey && r.delta === -UPKEEP_CREDITS && r.reason === "renew"
+    );
+    // Reclaim witness: EITHER the uncapped dedupe marker (Beacon's guard
+    // pointer 2026-09-27, covers 50-cap aging) OR the collapsed history row —
+    // same two-witness OR as publish: a crash between refund() and
+    // setDedupeMarker() leaves row-without-marker, and a marker-only check
+    // would double-refund the exact tear the collapse closed.
+    const reclaimed =
+      !!checkDedupe(renewKey + "#reclaim") ||
+      rows.some((r) => r.idem === renewKey + "#reclaim");
+    if (!charged || reclaimed) return false;
+    // Nova one-row collapse 2026-09-27: the refund row itself carries the
+    // #reclaim stamp (same two-write tear as publish).
+    if (identity.user)
+      acctRefund(identity.user.id, UPKEEP_CREDITS, "renew-reclaim", 0, renewKey + "#reclaim");
+    else refund(identity.ledgerKey, UPKEEP_CREDITS, "renew-reclaim", renewKey + "#reclaim");
+    // Beacon guard pointer 2026-09-27: uncapped witness, same shape as publish.
+    setDedupeMarker(renewKey + "#reclaim", { kind: "renew-reclaim", ownerKey }, RENEW_IDEM_TTL);
+    console.log("reclaimed stranded renew charge", renewKey);
+    return true;
+  } catch (e) {
+    console.log("reclaim failed:", e.message);
+    return false;
+  }
+}
+
+// a client-minted attemptId (same pattern as publish) — NOT on expiresAt,
+// which the first request mutates (a pure window key was smoke-tested and
+// double-charges, because the retry computes a different key once the expiry
+// has moved). Clients that don't send attemptId get a coarse minute-bucket
+// key, which catches the common double-click/immediate-retry case. A replay
+// returns the original result instead of charging again. Markers expire on
+// their own after a day — a marker can never outlive the retry window it
+// protects.
+const RENEW_IDEM_TTL = 24 * 60 * 60 * 1000;
 app.post("/api/sites/:id/renew", (req, res) => {
   const identity = resolveIdentity(req);
   if (!identity) return res.status(401).json({ error: "Sign in to renew." });
@@ -2091,21 +2591,48 @@ app.post("/api/sites/:id/renew", (req, res) => {
   const owner = identity.user ? "acct:" + identity.user.id : identity.ledgerKey;
   if (meta.owner !== owner)
     return res.status(403).json({ error: "Only the site owner can renew it." });
+  const { attemptId } = req.body || {};
+  const renewKey =
+    typeof attemptId === "string" && attemptId
+      ? `renew:${owner}:${id}:${attemptId}`
+      : `renew:${owner}:${id}:min:${Math.floor(Date.now() / 60000)}`;
+  // Nova: crash backstop. If a retry died between writeSiteMeta and
+  // setDedupeMarker, the marker is gone but the attemptId stamp survives in
+  // the meta — skip the re-bump instead of handing out 60 days for 40 credits.
+  // Presence-asserted on both sides: attemptId is optional, and a bare
+  // `undefined === undefined` would false-dedupe the next attemptId-less renew.
+  const stampKey = typeof attemptId === "string" && attemptId ? attemptId : null;
+  // Marker BEFORE stamp: a fresh retry still has its marker, which carries
+  // the original result WITH the post-charge balance — so both dedupe paths
+  // answer the same shape and the client never shows a stale number.
+  const prior = checkDedupe(renewKey);
+  if (prior && prior.result) return res.json({ ok: true, deduped: true, ...prior.result });
+  if (stampKey && meta.attemptId === stampKey) {
+    const credits = identity.user ? acctBalance(identity.user.id) : getBalance(identity.ledgerKey);
+    return res.json({ ok: true, deduped: true, id, expiresAt: meta.expiresAt, credits });
+  }
+
+  // Crash recovery: between chargeIdentity and writeSiteMeta there is a
+  // stranded-charge window (no marker, no stamp). Reclaim the stranded 40
+  // once, then the charge below lands exactly once — a crashed retry never
+  // pays 40 twice. Runs only on the no-marker path; the hot dedupe path
+  // above is untouched.
+  reclaimStrandedRenewCharge(identity, renewKey);
   // Renewal draws real credits only — never spin credits.
-  const spendRes = identity.user
-    ? acctSpend(identity.user.id, UPKEEP_CREDITS)
-    : { remaining: spend(identity.ledgerKey, UPKEEP_CREDITS), spinUsed: 0 };
-  const remaining = !spendRes ? null : spendRes.remaining;
+  const charged = chargeIdentity(identity, UPKEEP_CREDITS, "renew", false, renewKey);
+  const remaining = charged ? charged.remaining : null;
   if (remaining === null) {
     return res.status(402).json({
       error: `Renewal costs ${UPKEEP_CREDITS} credits. Top up to keep your site live.`,
     });
   }
   const now = Date.now();
-  meta.expiresAt =
-    meta.expiresAt && meta.expiresAt > now ? meta.expiresAt + UPKEEP_MS : now + UPKEEP_MS;
+  if (stampKey) meta.attemptId = stampKey; // same write as the bump — one atomic write, no split
+  meta.expiresAt = meta.expiresAt && meta.expiresAt > now ? meta.expiresAt + UPKEEP_MS : now + UPKEEP_MS;
   writeSiteMeta(id, meta);
-  res.json({ ok: true, id, expiresAt: meta.expiresAt, credits: remaining });
+  const renewResult = { id, expiresAt: meta.expiresAt, credits: remaining };
+  setDedupeMarker(renewKey, { result: renewResult }, RENEW_IDEM_TTL);
+  res.json({ ok: true, ...renewResult });
 });
 
 // Streams generated text from Anthropic, calling onText for each chunk.
@@ -2502,8 +3029,23 @@ function loadBeaconQueue() {
   try { const q = JSON.parse(fs.readFileSync(BEACON_QUEUE_PATH, "utf8")); return q && Array.isArray(q.messages) ? q : { messages: [] }; }
   catch { return { messages: [] }; }
 }
+// STAGED 2026-09-26 (Nova): archival trim — trimmed tail appends to a JSONL
+// archive before the 100-msg cap drops it, so the cap is rotation, never
+// deletion. Archive rides the same ephemeral disk as the queue: rotation-safe
+// between deploys, full history moves to pg with the ledgers long-term.
+const BEACON_ARCHIVE_PATH = path.join(__dirname, "beacon-archive.jsonl");
 function saveBeaconQueue(q) {
-  try { fs.writeFileSync(BEACON_QUEUE_PATH, JSON.stringify({ messages: q.messages.slice(-100) })); } catch {}
+  try {
+    const msgs = Array.isArray(q.messages) ? q.messages : [];
+    const trimmed = msgs.length > 100 ? msgs.slice(0, msgs.length - 100) : [];
+    if (trimmed.length) {
+      fs.appendFileSync(
+        BEACON_ARCHIVE_PATH,
+        trimmed.map(m => JSON.stringify(m)).join("\n") + "\n"
+      );
+    }
+    fs.writeFileSync(BEACON_QUEUE_PATH, JSON.stringify({ messages: msgs.slice(-100) }));
+  } catch {}
 }
 function beaconOwner(req) {
   const user = getSessionUser(req);
